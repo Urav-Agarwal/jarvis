@@ -47,6 +47,17 @@ class Microphone:
         threshold=0.03,
         start_timeout=3,
     ):
+        """
+        Record until speech ends. v4.1: the speech threshold ADAPTS
+        to this mic's noise floor — the audio doctor measured raw mic
+        RMS ~0.0002 on this machine, where a fixed 0.03 threshold
+        made normal speech inaudible (the "I have to shout" bug).
+        Noise floor is sampled from the first ~0.4 s and the speech
+        gate rides above it (floor + max(0.004, 8x floor)), clamped
+        to a sane range. Whisper also gets a louder signal because
+        quiet frames below a fixed floor are amplified before STT.
+        """
+
         print("Listening...")
 
         chunk_duration = 0.1
@@ -58,6 +69,11 @@ class Microphone:
 
         start_time = time.time()
         speech_wait_start = time.time()
+
+        noise_floor = None  # measured while waiting for speech
+        # Adaptive gate: above the measured floor, but never below a
+        # small absolute floor (protects against a perfect 0.0 floor)
+        # and never so high that normal speech cannot cross it.
 
         with sd.InputStream(
             device=self.device,
@@ -73,13 +89,39 @@ class Microphone:
                 audio = np.squeeze(audio)
                 audio_chunks.append(audio.copy())
 
-                volume = np.max(np.abs(audio))
-                
+                volume = float(np.max(np.abs(audio)))
+
+                if not speech_started:
+                    # NOISE FLOOR = the MINIMUM of the first ~0.5 s of
+                    # frames, then LOCKED. Max-tracking ratchets raced
+                    # the voice and choked on DC-noise rooms (both
+                    # caught by the fake-mic unit tests); min-tracking
+                    # converges to the true room level.
+                    if noise_floor is None:
+                        noise_floor = [volume]
+
+                    elif len(noise_floor) < 5:
+                        noise_floor.append(volume)
+
+                    if len(noise_floor) >= 5:
+                        floor_value = min(noise_floor)
+
+                    else:
+                        floor_value = min(noise_floor)
+
+                    effective_threshold = max(
+                        threshold * 0.2,  # never below 0.006
+                        min(
+                            threshold,          # never above 0.03
+                            floor_value * 8 + 0.004,
+                        ),
+                    )
+
                 if not speech_started and time.time() - speech_wait_start >= start_timeout:
                     print("No speech started.")
                     return np.array([], dtype="float32")
 
-                if volume > threshold:
+                if volume > effective_threshold:
                     speech_started = True
                     silence_start = None
 
@@ -98,7 +140,19 @@ class Microphone:
             print("No speech detected.")
             return np.array([], dtype="float32")
 
-        return np.concatenate(audio_chunks)
+        recorded = np.concatenate(audio_chunks)
+
+        # NORMALIZE for STT: a mic this quiet produces whisper-quiet
+        # audio that Whisper struggles with. Bring speech peaks to a
+        # healthy level without clipping.
+        peak = float(np.max(np.abs(recorded)))
+
+        if 0.0 < peak < 0.05:
+            recorded = recorded * min(8.0, 0.30 / peak)
+
+            recorded = np.clip(recorded, -1.0, 1.0)
+
+        return recorded.astype("float32")
 
 
 if __name__ == "__main__":

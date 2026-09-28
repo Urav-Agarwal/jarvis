@@ -8,6 +8,17 @@ from openwakeword.model import Model
 from app.config import get as get_setting
 
 
+# Sensitivity presets (v4.1 A3): the user had to SHOUT because the
+# raw mic level at normal volume never crossed the fixed threshold.
+# "high" = wakes from a quiet voice (more false-positive risk, but
+# two-frame + refractory guard against storms).
+_SENSITIVITY_THRESHOLDS = {
+    "low": 0.50,
+    "medium": 0.35,
+    "high": 0.22,
+}
+
+
 class WakeWordDetector:
     def __init__(self):
         self.model = Model(
@@ -22,8 +33,17 @@ class WakeWordDetector:
         self._pending_score = 0.0
         self._pending_frames = 0
 
-        self.threshold = (
-            get_setting("wake_word", "threshold") or 0.35
+        sensitivity = (
+            str(get_setting("wake_word", "sensitivity") or "medium")
+            .lower()
+            .strip()
+        )
+
+        self.sensitivity = sensitivity
+
+        self.threshold = _SENSITIVITY_THRESHOLDS.get(
+            sensitivity,
+            float(get_setting("wake_word", "threshold") or 0.35),
         )
 
         self.sample_rate = (
@@ -32,12 +52,90 @@ class WakeWordDetector:
 
         self.chunk_size = 1280
 
+        # ----------------------------------------------------
+        # AGC (automatic gain control): normalise each frame's RMS
+        # to a target level before the model sees it. The audio
+        # doctor measured mic RMS ~0.0001 idle — at that level a
+        # normal spoken "hey Jarvis" scores far below threshold,
+        # which is exactly the "I have to shout" symptom.
+        # NOTE: YAML "true" can arrive as bool True or str "true"
+        # depending on the loader; handle BOTH explicitly.
+        # ----------------------------------------------------
+        agc_setting = get_setting("wake_word", "agc")
+
+        self.agc_enabled = not (
+            agc_setting is False
+            or (isinstance(agc_setting, str)
+                and agc_setting.strip().lower() in {"false", "0", "no"})
+        )  # default ON
+
+        self._agc_target_rms = 0.05
+
+        self._agc_max_gain = 25.0
+
+        self._agc_gain = 1.0
+
+        # Live meters (read by the UI mic meter and wake_doctor).
+        self.last_rms = 0.0
+        self.last_score = 0.0
+        self.last_gain = 1.0
+
         # Transcript of the speech detected in the latest listen()
         # call (set by the orchestrator's filming-mode handler when
         # available). None when no transcript was captured.
         self.last_transcript = None
 
-        print("Wake-word detector ready.")
+        print(
+            f"Wake-word detector ready "
+            f"(sensitivity={self.sensitivity}, "
+            f"threshold={self.threshold:.2f}, "
+            f"agc={'on' if self.agc_enabled else 'off'})."
+        )
+
+    def _agc(self, audio: np.ndarray) -> np.ndarray:
+        """
+        Amplify the frame towards the target RMS with a SMOOTHED gain
+        (fast attacks would pump noise up into words). Works on the
+        int16 frame; output stays in int16 range.
+        """
+
+        if not self.agc_enabled:
+            self.last_gain = 1.0
+
+            return audio
+
+        # RMS in FLOAT scale (0..1) — the target is float-scale too.
+        # (Int16-unit RMS made `wanted` always < 1 and the AGC a
+        # no-op; caught by the wake doctor's synthetic-frame check.)
+        # caught by the wake doctor's synthetic-frame check.)
+        frame_rms = float(
+            np.sqrt(
+                np.mean(audio.astype(np.float64) ** 2)
+            )
+            / 32767.0
+        )
+
+        self.last_rms = frame_rms
+
+        if frame_rms < 1e-6:
+            # Digital silence: keep the last gain, do not divide.
+            self.last_gain = self._agc_gain
+
+            return audio
+
+        wanted = self._agc_target_rms / frame_rms
+
+        wanted = max(1.0, min(self._agc_max_gain, wanted))
+
+        # Smooth: 80% previous gain, 20% new demand.
+        self._agc_gain = 0.8 * self._agc_gain + 0.2 * wanted
+
+        self.last_gain = self._agc_gain
+
+        # Amplify in int16 units (frame is int16, gain is a factor).
+        amplified = audio.astype(np.float64) * self._agc_gain
+
+        return np.clip(amplified, -32767, 32767).astype(np.int16)
 
     def listen(self, cooldown: float = 0.0):
         """
@@ -74,6 +172,10 @@ class WakeWordDetector:
 
                 audio = np.squeeze(audio)
 
+                # AGC before the model: normal-volume speech reaches
+                # the model at a usable level (v4.1 A3).
+                audio = self._agc(audio)
+
                 # Keep the model's buffers fed during the cooldown so
                 # its state stays continuous, but never trigger.
                 prediction = self.model.predict(audio)
@@ -82,6 +184,8 @@ class WakeWordDetector:
                     continue
 
                 score = prediction["hey_jarvis"]
+
+                self.last_score = score
 
                 # Two-frame confirmation: the score must stay above
                 # threshold twice in a row. A single loud frame (a
@@ -92,7 +196,13 @@ class WakeWordDetector:
 
                     if self._pending_frames >= 2:
                         self._pending_frames = 0
-                        print("HEY JARVIS DETECTED!")
+                        print(
+                            "HEY JARVIS DETECTED! "
+                            f"(score={score:.2f}, "
+                            f"rms={self.last_rms:.4f}, "
+                            f"gain={self.last_gain:.1f})"
+                        )
+
                         return True
 
                 else:

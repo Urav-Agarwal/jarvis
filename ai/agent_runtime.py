@@ -170,6 +170,19 @@ class AgentRuntime:
             elapsed_ms=(time.time() - started) * 1000,
         )
 
+        # v4.1 latency: accumulate tool time into the exchange trace.
+        try:
+            from app.latency import add_ms as _add_ms
+
+            _add_ms(
+                getattr(self, "_trace_id", 0) or 0,
+                "tools",
+                (time.time() - started) * 1000,
+            )
+
+        except Exception:
+            pass
+
         return result
 
     def _execute_confirmed(self, tool_name, parameters=None):
@@ -265,6 +278,16 @@ class AgentRuntime:
         # Fresh turn: the honesty judge only trusts receipts from
         # THIS turn's tool executions.
         self.last_tool_receipt = None
+
+        # v4.1 latency: reset the per-turn LLM accumulator and connect
+        # this runtime to the orchestrator's exchange trace (if any).
+        self.brain.total_llm_ms = 0.0
+
+        self._trace_id = getattr(
+            getattr(self, "_orchestrator_ref", None),
+            "_trace_id",
+            None,
+        )
 
         # -------------------------------------------------
         # GOODBYE / SLEEP (v2 position: before everything): "thank
@@ -525,7 +548,21 @@ class AgentRuntime:
             engine="brain_v3",
         )
 
-        return self.brain_loop.run(user_input, context=context)
+        result = self.brain_loop.run(user_input, context=context)
+
+        # v4.1 latency: fold the accumulated LLM time into the trace.
+        try:
+            from app.latency import add_ms as _add_ms
+
+            llm_ms = getattr(self.brain, "total_llm_ms", 0.0)
+
+            if llm_ms > 0:
+                _add_ms(self._trace_id, "llm", llm_ms)
+
+        except Exception:
+            pass
+
+        return result
 
     def _clear_transient_state(self):
         """

@@ -1,0 +1,6856 @@
+﻿
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\action_recorder.py =====
+
+"""
+Screen-observation action recorder for JARVIS.
+
+The user performs a task manually while JARVIS watches the SCREEN â€”
+not mouse coordinates or raw keystrokes. Every few seconds a
+screenshot is taken and interpreted by the vision model into a
+semantic observation: which application is open, which site or
+document is visible, what changed since the last observation.
+
+On stop, the observation timeline is converted into concrete tool
+steps (open app, navigate browser, open file) and stored as a
+reusable skill â€” so saying the trigger replays the same ACTIONS.
+
+Computer-level actions (mouse/keyboard steps) are only recorded when
+the observation explicitly names them (e.g. a form field the cursor
+fills), never as raw coordinates.
+"""
+
+import os
+import re
+import threading
+import time
+
+
+class ActionRecorder:
+    """
+    Watch-the-screen learning mode: start -> observe -> stop ->
+    replayable skill. Runs a background thread while active.
+    """
+
+    def __init__(self, vision=None, interval: float = 6.0):
+        self.vision = vision
+        self.interval = interval
+
+        self.active = False
+        self.observations = []
+
+        self._thread = None
+        self._lock = threading.Lock()
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def is_active(self) -> bool:
+        return self.active
+
+    def start(self) -> dict:
+        with self._lock:
+            if self.active:
+                return {
+                    "success": True,
+                    "already_recording": True,
+                    "message": "I'm already watching and learning.",
+                }
+
+            self.active = True
+            self.observations = []
+
+        self._thread = threading.Thread(
+            target=self._observe_loop,
+            daemon=True,
+        )
+
+        self._thread.start()
+
+        return {
+            "success": True,
+            "message": (
+                "Watching. Do the task on your screen now â€” I'm seeing "
+                "which apps and sites you use, not your mouse. Say "
+                "'stop learning' when you're done and I'll save it."
+            ),
+        }
+
+    def stop(self) -> dict:
+        with self._lock:
+            was_active = self.active
+
+            self.active = False
+            observations = list(self.observations)
+            self.observations = []
+
+        if not was_active:
+            return {
+                "success": False,
+                "error": "I wasn't recording anything.",
+            }
+
+        steps = self.build_steps(observations)
+
+        return {
+            "success": True,
+            "observation_count": len(observations),
+            "steps": steps,
+            "observations": [
+                observation.get("summary", "")
+                for observation in observations
+            ],
+            "message": self._summarize(steps),
+        }
+
+    def cancel(self) -> dict:
+        with self._lock:
+            was_active = self.active
+
+            self.active = False
+            self.observations = []
+
+        if not was_active:
+            return {"success": False, "error": "Nothing was recording."}
+
+        return {
+            "success": True,
+            "message": "Cancelled. Nothing was saved.",
+        }
+
+    # ==================================================
+    # OBSERVATION LOOP
+    # ==================================================
+
+    def _observe_loop(self):
+        while self.active:
+            try:
+                observation = self._observe_once()
+
+                if observation:
+                    with self._lock:
+                        self.observations.append(observation)
+
+            except Exception:
+                pass
+
+            # Sleep in short slices so stop reacts quickly.
+            slept = 0.0
+
+            while slept < self.interval and self.active:
+                time.sleep(0.5)
+                slept += 0.5
+
+    def _observe_once(self) -> dict | None:
+        """
+        One screen sample: active window (process + title) always,
+        plus a vision summary of what is visible when the vision
+        provider is available.
+        """
+
+        from tools.computer_observer import ComputerObserver
+
+        try:
+            window = ComputerObserver().get_active_window()
+
+        except Exception:
+            window = {}
+
+        if not window.get("success"):
+            return None
+
+        process = (window.get("process") or "").strip()
+        title = (window.get("title") or "").strip()
+
+        observation = {
+            "time": time.time(),
+            "app": process,
+            "title": title,
+            "summary": "",
+        }
+
+        if self.vision is not None:
+            try:
+                analysis = self.vision.analyze(
+                    "In ONE short sentence: which app/site/file is on "
+                    "screen and what is being done? Skip mouse or "
+                    "keyboard details."
+                )
+
+                observation["summary"] = str(
+                    analysis.get("result") or analysis.get("analysis") or ""
+                )[:220]
+
+            except Exception:
+                observation["summary"] = ""
+
+        return observation
+
+    # ==================================================
+    # OBSERVATIONS -> TOOL STEPS
+    # ==================================================
+
+    _BROWSER_PROCESSES = {
+        "chrome.exe": "chrome",
+        "msedge.exe": "edge",
+        "firefox.exe": "firefox",
+        "brave.exe": "brave",
+        "opera.exe": "opera",
+        "comet.exe": "comet",
+    }
+
+    _TOOL_EXES = {
+        "notepad.exe": "notepad",
+        "calc.exe": "calculator",
+        "mspaint.exe": "paint",
+        "code.exe": "vscode",
+        "winword.exe": "word",
+        "excel.exe": "excel",
+        "powerpnt.exe": "powerpoint",
+        "spotify.exe": "spotify",
+        "discord.exe": "discord",
+        "whatsapp.exe": "whatsapp",
+        "explorer.exe": "file explorer",
+    }
+
+    # Sections of a window title that are just app branding â€”
+    # stripping them keeps the real document/site name.
+    _TITLE_SUFFIXES = (
+        " - google chrome", " - mozilla firefox",
+        " - microsoft edge", " - brave", " - opera",
+        " - visual studio code", " - notepad",
+        " - word", " - excel", " - powerpoint",
+    )
+
+    def build_steps(self, observations) -> list:
+        """
+        Collapse the observation timeline into ordered tool steps:
+        application.open for each distinct app, browser.navigate for
+        each distinct URL/site seen in a browser window title.
+        """
+
+        steps = []
+        seen_apps = set()
+        seen_sites = set()
+
+        for observation in observations:
+            app = (observation.get("app") or "").lower()
+
+            if not app:
+                continue
+
+            # ---------------------------------------------
+            # Browser observation -> navigation step.
+            # ---------------------------------------------
+            browser = self._BROWSER_PROCESSES.get(app)
+
+            if browser:
+                site = self._site_from_title(
+                    observation.get("title") or ""
+                )
+
+                if site and site not in seen_sites:
+                    seen_sites.add(site)
+
+                    steps.append(
+                        {
+                            "tool": "browser.navigate",
+                            "parameters": {"url": site},
+                        }
+                    )
+
+                if browser not in seen_apps:
+                    seen_apps.add(browser)
+
+                    steps.insert(
+                        0,
+                        {
+                            "tool": "application.open",
+                            "parameters": {"application": browser},
+                        },
+                    )
+
+                continue
+
+            # ---------------------------------------------
+            # Desktop application observation -> open step.
+            # ---------------------------------------------
+            tool_app = self._TOOL_EXES.get(app)
+
+            if tool_app and tool_app not in seen_apps:
+                seen_apps.add(tool_app)
+
+                steps.append(
+                    {
+                        "tool": "application.open",
+                        "parameters": {"application": tool_app},
+                    }
+                )
+
+        return steps
+
+    def _site_from_title(self, title: str) -> str | None:
+        """
+        Best-effort site URL from a browser window title: tab titles
+        rarely contain the domain, so produce a search URL for the
+        document/site name instead of a wrong deep link.
+        """
+
+        cleaned = (title or "").strip().lower()
+
+        for suffix in self._TITLE_SUFFIXES:
+            if cleaned.endswith(suffix):
+                cleaned = cleaned[: -len(suffix)].strip(" -|")
+
+        cleaned = re.sub(
+            r"\s*[-|\u2013]\s*(?:\d+\s+)?(?:new\s+)?"
+            r"(?:tab|incognito|window)\s*$",
+            "",
+            cleaned,
+        ).strip()
+
+        if not cleaned or cleaned in {"new tab", "untitled"}:
+            return None
+
+        # An explicit domain in the title -> real URL.
+        domain = re.search(
+            r"([a-z0-9-]+\.(?:com|org|net|edu|in|io|co|dev))",
+            cleaned,
+        )
+
+        if domain:
+            return "https://" + domain.group(1)
+
+        from urllib.parse import quote
+
+        return (
+            "https://www.google.com/search?q=" + quote(cleaned)
+        )
+
+    def _summarize(self, steps) -> str:
+        if not steps:
+            return (
+                "I watched, but couldn't identify stable steps to "
+                "save â€” the task may have been too visual."
+            )
+
+        parts = []
+
+        for step in steps:
+            tool = step["tool"]
+            parameters = step.get("parameters", {})
+
+            if tool == "application.open":
+                parts.append(
+                    f"open {parameters.get('application', 'the app')}"
+                )
+
+            elif tool == "browser.navigate":
+                parts.append(
+                    f"go to {parameters.get('url', 'the site')}"
+                )
+
+            else:
+                parts.append(tool)
+
+        return (
+            "I saw these steps: "
+            + "; ".join(parts[:6])
+            + "."
+        )
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\applications.py =====
+
+from pathlib import Path
+import os
+
+
+class ApplicationManager:
+    def __init__(self):
+        self.applications = {}
+        self.refresh_applications()
+
+    def refresh_applications(self):
+        self.applications.clear()
+
+        start_menu_locations = [
+            Path(os.environ.get("APPDATA", ""))
+            / "Microsoft/Windows/Start Menu/Programs",
+
+            Path(os.environ.get("PROGRAMDATA", ""))
+            / "Microsoft/Windows/Start Menu/Programs",
+        ]
+
+        for location in start_menu_locations:
+            self._scan_directory(location)
+
+    def _scan_directory(self, directory: Path):
+        if not directory.exists():
+            return
+
+        try:
+            for path in directory.rglob("*"):
+                if path.is_file() and path.suffix.lower() in {
+                    ".lnk",
+                    ".url",
+                }:
+                    name = path.stem.lower().strip()
+
+                    if name and name not in self.applications:
+                        self.applications[name] = path
+
+        except (PermissionError, OSError):
+            pass
+
+    # Windows 11 delivers common apps as Store packages that do not
+    # appear in Start Menu folders; fall back to known executables
+    # and URI schemes for the most common aliases.
+    FALLBACK_LAUNCHERS = {
+        "notepad": ["notepad.exe"],
+        "calculator": ["calc.exe", "ms-calculator:"],
+        "calc": ["calc.exe", "ms-calculator:"],
+        "paint": ["mspaint.exe", "ms-paint:"],
+        "cmd": ["cmd.exe"],
+        "command prompt": ["cmd.exe"],
+        "terminal": ["wt.exe"],
+        "settings": ["ms-settings:"],
+    }
+
+    # URI schemes for Store apps that ship no Start Menu shortcut.
+    URI_SCHEMES = {
+        "whatsapp": "whatsapp:",
+        "instagram": "instagram:",
+        "microsoft store": "ms-windows-store:",
+        "store": "ms-windows-store:",
+        "calculator": "calculator:",
+        "mail": "mailto:",
+        "teams": "msteams:",
+        "spotify": "spotify:",
+        "telegram": "tg:",
+        "instagram": "instagram:",
+        "netflix": "netflix:",
+    }
+
+    def open_application(self, name: str) -> bool:
+        application_path = self.find_application(name)
+
+        if application_path is not None:
+            try:
+                os.startfile(application_path)
+                return True
+            except OSError:
+                pass
+
+        requested = name.lower().strip()
+
+        for launcher in self.FALLBACK_LAUNCHERS.get(requested, []):
+            try:
+                os.startfile(launcher)
+                return True
+            except OSError:
+                continue
+
+        # Start-menu scan missed it: ask Windows for the registered
+        # Start-apps list (covers Store/UAL apps like WhatsApp).
+        if self._open_via_start_apps(requested):
+            return True
+
+        # Known URI scheme as the last resort.
+        scheme = self.URI_SCHEMES.get(requested)
+
+        if scheme:
+            try:
+                os.startfile(scheme)
+                return True
+            except OSError:
+                pass
+
+        return False
+
+    def _open_via_start_apps(self, requested: str) -> bool:
+        """
+        Resolve an app against the Windows 'Get-StartApps' registry
+        (all apps the Start menu can launch, including Store apps
+        without .lnk files), then launch by its AUMID shell: URI.
+        """
+
+        if not requested:
+            return False
+
+        try:
+            import subprocess
+            import json
+
+            output = subprocess.run(
+                [
+                    "powershell", "-NoProfile", "-Command",
+                    "Get-StartApps | ConvertTo-Json -Compress",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+
+            apps = json.loads(output.stdout or "[]")
+
+            if isinstance(apps, dict):
+                apps = [apps]
+
+            def normalized(value):
+                return " ".join(
+                    str(value).lower().replace("!", " ").split()
+                )
+
+            target = normalized(requested)
+
+            exact = None
+            partial = None
+
+            for app in apps:
+                app_name = normalized(app.get("Name", ""))
+                app_id = app.get("AppID", "")
+
+                if not app_name or not app_id:
+                    continue
+
+                if app_name == target:
+                    exact = app_id
+                    break
+
+                if partial is None and (
+                    target in app_name or app_name in target
+                ):
+                    partial = app_id
+
+            app_id = exact or partial
+
+            if not app_id:
+                return False
+
+            # Store/UAL apps MUST be launched through the shell
+            # namespace; a bare AUMID fails silently with plain
+            # startfile() (this is why Instagram never opened).
+            os.startfile(f"shell:AppsFolder\\{app_id}")
+            return True
+
+        except (
+            OSError,
+            ValueError,
+            json.JSONDecodeError,
+            subprocess.TimeoutExpired,
+        ):
+            return False
+
+    def get_application_state(self, name: str):
+        requested = name.lower().strip()
+
+        if not requested:
+            return {
+                "success": False,
+                "error": "Application name was not provided.",
+            }
+
+        try:
+            from tools.computer_observer import ComputerObserver
+
+            observer = ComputerObserver()
+            result = observer.get_running_applications()
+
+            if not result.get("success"):
+                return result
+
+            matches = []
+
+            for application in result.get("applications", []):
+                process_name = application.get("name", "").lower()
+                window_title = application.get("window", "").lower()
+
+                clean_process_name = process_name.removesuffix(".exe")
+
+                if (
+                    requested == clean_process_name
+                    or requested == process_name
+                    or requested in clean_process_name
+                    or requested in window_title
+                ):
+                    matches.append(application)
+
+            return {
+                "success": True,
+                "application": name,
+                "running": bool(matches),
+                "matches": matches,
+            }
+
+        except Exception as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def close_application(self, name: str):
+        """
+        Gracefully request that an application close.
+
+        This does NOT force-kill the process.
+        Windows/application dialogs are allowed to handle
+        unsaved work normally.
+        """
+
+        requested = name.lower().strip()
+
+        if not requested:
+            return {
+                "success": False,
+                "application": name,
+                "error": "Application name was not provided.",
+            }
+
+        try:
+            import win32gui
+            import win32process
+            import psutil
+
+            matching_pids = set()
+
+            observer_result = self.get_application_state(name)
+
+            if observer_result.get("success"):
+                for application in observer_result.get("matches", []):
+                    pid = application.get("pid")
+
+                    if pid:
+                        matching_pids.add(int(pid))
+
+            if not matching_pids:
+                return {
+                    "success": False,
+                    "application": name,
+                    "closed": False,
+                    "error": f"{name} is not currently running.",
+                }
+
+            windows = []
+
+            def collect_window(hwnd, _):
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+
+                if win32gui.GetWindow(hwnd, win32con.GW_OWNER):
+                    return True
+
+                try:
+                    _, pid = win32process.GetWindowThreadProcessId(hwnd)
+
+                    if pid in matching_pids:
+                        title = win32gui.GetWindowText(hwnd).strip()
+
+                        if title:
+                            windows.append(hwnd)
+
+                except Exception:
+                    pass
+
+                return True
+
+            import win32con
+
+            win32gui.EnumWindows(collect_window, None)
+
+            if not windows:
+                return {
+                    "success": False,
+                    "application": name,
+                    "closed": False,
+                    "error": (
+                        f"{name} is running, but no closable visible "
+                        "application window was found."
+                    ),
+                }
+
+            requested_windows = 0
+
+            for hwnd in windows:
+                try:
+                    win32gui.PostMessage(
+                        hwnd,
+                        win32con.WM_CLOSE,
+                        0,
+                        0,
+                    )
+                    requested_windows += 1
+                except Exception:
+                    pass
+
+            return {
+                "success": requested_windows > 0,
+                "application": name,
+                "closed": requested_windows > 0,
+                "windows_requested": requested_windows,
+                "message": (
+                    "A graceful close was requested. "
+                    "Any unsaved-work prompt remains under the "
+                    "application's control."
+                ),
+            }
+
+        except Exception as error:
+            return {
+                "success": False,
+                "application": name,
+                "closed": False,
+                "error": str(error),
+            }
+
+    def find_application(self, name: str):
+        name = name.lower().strip()
+
+        if name in self.applications:
+            return self.applications[name]
+
+        matches = [
+            (app_name, path)
+            for app_name, path in self.applications.items()
+            if name in app_name or app_name in name
+        ]
+
+        if len(matches) == 1:
+            return matches[0][1]
+
+        return None
+
+
+if __name__ == "__main__":
+    manager = ApplicationManager()
+
+    print("APPLICATION DISCOVERY READY")
+    print()
+    print(f"Applications found: {len(manager.applications)}")
+    print()
+
+    for name in sorted(manager.applications):
+        print(f"- {name}")
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\app_messenger.py =====
+
+"""
+Messaging across desktop apps.
+
+WhatsApp has a full adapter (chat search + send via keyboard
+automation). Other Electron-style apps (Discord, Instagram, Telegram)
+share the same shape: activate window, paste recipient/message, Enter.
+A generic adapter handles them honestly â€” with per-app known
+limitations reported instead of pretending success.
+"""
+
+import time
+
+import win32gui
+
+from tools.whatsapp import (
+    _activate_window,
+    _paste_text,
+    press_combo,
+    press_key,
+    VK_CONTROL,
+    VK_ESCAPE,
+    VK_RETURN,
+)
+
+
+# Apps with a Ctrl+F / search-first chat flow similar to WhatsApp.
+_SEARCH_FIRST_APPS = {
+    "discord": "discord",
+    "instagram": "instagram",
+    "telegram": "telegram",
+}
+
+# Known app window-title fragments (case-insensitive).
+_WINDOW_HINTS = {
+    "whatsapp": "whatsapp",
+    "discord": "discord",
+    "instagram": "instagram",
+    "telegram": "telegram",
+}
+
+
+def _find_app_window(app_name: str):
+    """Return the main visible window handle for app_name, or None."""
+
+    fragment = _WINDOW_HINTS.get(app_name.lower(), app_name.lower())
+
+    found = []
+
+    def collect(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return True
+
+        title = (win32gui.GetWindowText(hwnd) or "").lower()
+
+        if fragment in title:
+            found.append((hwnd, win32gui.GetWindowText(hwnd)))
+
+        return True
+
+    win32gui.EnumWindows(collect, None)
+
+    return found[0] if found else None
+
+
+def is_app_running(app_name: str) -> bool:
+    try:
+        import psutil
+
+        needle = app_name.lower()
+
+        for process in psutil.process_iter(["name"]):
+            name = (process.info["name"] or "").lower()
+
+            if needle in name:
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def send_message_in_app(app_name: str, contact: str, message: str) -> dict:
+    """
+    Generic send: focus the app window, search the contact, paste the
+    message, press Enter. WhatsApp gets the dedicated, verified flow;
+    other apps get the generic flow with honest reporting.
+    """
+
+    app_name = (app_name or "").strip().lower()
+    contact = (contact or "").strip()
+    message = (message or "").strip()
+
+    if not app_name:
+        return {
+            "success": False,
+            "error": "Which app should I send it through?",
+        }
+
+    if not contact or not message:
+        return {
+            "success": False,
+            "error": "I need both a contact and a message to send.",
+        }
+
+    if app_name == "whatsapp":
+        # Dedicated adapter with chat-open verification.
+        from tools.whatsapp import send_message
+
+        return send_message(contact, message)
+
+    if not is_app_running(app_name):
+        return {
+            "success": False,
+            "error": (
+                f"{app_name.title()} is not running. Please open it "
+                "and sign in first, then ask me again."
+            ),
+        }
+
+    window = _find_app_window(app_name)
+
+    if window is None:
+        return {
+            "success": False,
+            "error": (
+                f"{app_name.title()} is running but no window was "
+                "found. Please bring it up and try again."
+            ),
+        }
+
+    hwnd, title = window
+
+    if not _activate_window(hwnd):
+        return {
+            "success": False,
+            "error": (
+                f"I couldn't bring the {app_name.title()} window to "
+                "the front."
+            ),
+        }
+
+    time.sleep(1.0)
+
+    # Search-first apps: focus the in-app search, paste the contact,
+    # open the chat. Others assume the chat is already selected.
+    if app_name in _SEARCH_FIRST_APPS:
+        press_key(VK_ESCAPE)
+        time.sleep(0.3)
+        press_combo(VK_CONTROL, VK_F)
+        time.sleep(0.6)
+
+        if not _paste_text(contact):
+            return {
+                "success": False,
+                "error": "I couldn't use the clipboard to search.",
+            }
+
+        time.sleep(1.4)
+        press_key(VK_RETURN)
+        time.sleep(0.9)
+
+    # Type the message and send.
+    if not _paste_text(message):
+        return {
+            "success": False,
+            "error": "I couldn't paste the message.",
+        }
+
+    time.sleep(0.4)
+    press_key(VK_RETURN)
+    time.sleep(0.6)
+
+    return {
+        "success": True,
+        "message": (
+            f"Message typed and sent in {app_name.title()} "
+            f"({title[:40]}). Glance at the chat to confirm it landed "
+            "on the right conversation."
+        ),
+    }
+
+
+if __name__ == "__main__":
+    print("window:", _find_app_window("whatsapp"))
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\browser.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\browsers.py =====
+
+from tools.browser_detector import BrowserDetector
+from tools.profiles import (
+    UserDataDirectoryFinder,
+    ChromiumProfileResolver,
+)
+
+
+class BrowserManager:
+    def __init__(self):
+        self.detector = BrowserDetector()
+        self.user_data_finder = UserDataDirectoryFinder()
+        self.profile_resolver = ChromiumProfileResolver()
+
+        self.browsers = {}
+
+        self.refresh_browsers()
+
+    def refresh_browsers(self):
+        self.browsers = self.detector.discover_browsers()
+
+    def find_browser(self, name: str):
+        requested = name.lower().strip()
+
+        if requested in self.browsers:
+            return self.browsers[requested]
+
+        matches = [
+            browser
+            for browser_name, browser in self.browsers.items()
+            if requested in browser_name
+            or browser_name in requested
+        ]
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
+
+    def get_profiles(self, browser_name: str):
+        browser = self.find_browser(browser_name)
+
+        if browser is None:
+            return []
+
+        user_data_directory = (
+            self.user_data_finder.find_for_browser(
+                browser["name"],
+                browser["executable"],
+            )
+        )
+
+        if user_data_directory is None:
+            return []
+
+        return self.profile_resolver.discover_profiles(
+            user_data_directory
+        )
+
+    def open_browser(self, name: str, profile_name=None):
+        browser = self.find_browser(name)
+
+        if browser is None:
+            return False
+
+        command = [browser["executable"]]
+
+        if profile_name:
+            profiles = self.get_profiles(name)
+
+            profile = self.profile_resolver.resolve_profile(
+                profiles,
+                profile_name,
+            )
+
+            if profile is None:
+                return False
+
+            command.append(
+                f"--profile-directory={profile.directory}"
+            )
+
+        try:
+            import subprocess
+            subprocess.Popen(command)
+            return True
+        except OSError:
+            return False
+
+    def get_browser_state(self, name: str):
+        from tools.computer_observer import ComputerObserver
+
+        browser = self.find_browser(name)
+
+        if browser is None:
+            return {
+                "success": False,
+                "error": f"Browser '{name}' was not found on this computer.",
+            }
+
+        executable = browser["executable"]
+        executable_name = executable.rsplit("\\", 1)[-1].lower()
+
+        observer = ComputerObserver()
+        result = observer.get_running_applications()
+
+        if not result.get("success"):
+            return result
+
+        matches = []
+
+        for application in result.get("applications", []):
+            process_name = application.get("name", "").lower()
+
+            if process_name == executable_name:
+                matches.append(application)
+
+        return {
+            "success": True,
+            "browser": browser["name"],
+            "running": bool(matches),
+            "matches": matches,
+        }
+
+
+if __name__ == "__main__":
+    manager = BrowserManager()
+
+    print("BROWSER MANAGER READY")
+    print()
+
+    print(
+        f"Browsers found: "
+        f"{len(manager.browsers)}"
+    )
+
+    print()
+
+    for name, browser in sorted(
+        manager.browsers.items()
+    ):
+        print(
+            f"- {browser['name']} -> "
+            f"{browser['executable']}"
+        )
+
+    print()
+    print("PROFILE TEST")
+    print()
+
+    for profile in manager.get_profiles("Chrome"):
+        print(
+            f"- {profile.name} -> {profile.directory}"
+        )
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\browser_control.py =====
+
+"""
+Browser interaction tools for JARVIS.
+
+Deterministic Windows-level control of the active browser window:
+navigate (address bar), refresh, back/forward, tab URL via clipboard,
+and reading selectable page text through the clipboard.
+
+No third-party automation framework required.
+"""
+
+import re
+import time
+
+import win32clipboard
+
+from tools.computer_controller import ComputerController
+
+
+class BrowserController:
+    """Controls the active browser window via keyboard automation."""
+
+    VK_RETURN = 0x0D
+    VK_CONTROL = 0x11
+    VK_MENU = 0x12  # Alt
+    VK_ESCAPE = 0x1B
+    VK_LEFT = 0x25
+    VK_RIGHT = 0x27
+    VK_DELETE = 0x2E
+    KEYEVENTF_KEYUP = 0x0002
+
+    def __init__(self):
+        self.controller = ComputerController()
+
+    # ==================================================
+    # PUBLIC OPERATIONS
+    # ==================================================
+
+    _BROWSER_EXES = {
+        "chrome.exe", "msedge.exe", "firefox.exe", "brave.exe",
+        "opera.exe", "comet.exe", "safari.exe", "browser.exe",
+    }
+
+    def focus_browser(self) -> bool:
+        """
+        Bring a browser window to the foreground so keyboard input
+        reaches it. Returns True only when the browser window is
+        verified as the foreground window.
+        """
+
+        import ctypes
+        import time as _time
+
+        import win32gui
+        import win32process
+        import psutil
+
+        target = {"hwnd": None}
+
+        def enum_handler(hwnd, _):
+            if not win32gui.IsWindowVisible(hwnd):
+                return
+
+            try:
+                _, pid = win32process.GetWindowThreadProcessId(hwnd)
+
+                exe = psutil.Process(pid).name().lower()
+
+                if exe in self._BROWSER_EXES and win32gui.GetWindowText(hwnd):
+                    target["hwnd"] = hwnd
+
+            except Exception:
+                pass
+
+        win32gui.EnumWindows(enum_handler, None)
+
+        hwnd = target["hwnd"]
+
+        if hwnd is None:
+            return False
+
+        user32 = ctypes.windll.user32
+
+        HWND_TOPMOST = -1
+        HWND_NOTOPMOST = -2
+        SWP_NOMOVE = 0x0002
+        SWP_NOSIZE = 0x0001
+
+        for _attempt in range(3):
+            foreground = user32.GetForegroundWindow()
+
+            if foreground == hwnd or self._foreground_is_browser():
+                _time.sleep(0.2)
+                return True
+
+            foreground_thread = (
+                user32.GetWindowThreadProcessId(foreground, 0)
+                if foreground
+                else 0
+            )
+
+            target_thread = win32process.GetWindowThreadProcessId(hwnd)[0]
+
+            attached = False
+
+            if foreground_thread and foreground_thread != target_thread:
+                attached = bool(
+                    user32.AttachThreadInput(
+                        foreground_thread,
+                        target_thread,
+                        True,
+                    )
+                )
+
+            try:
+                win32gui.ShowWindow(hwnd, 9)  # SW_RESTORE
+                win32gui.BringWindowToTop(hwnd)
+
+                # Topmost-toggle: the reliable focus-steal bypass.
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                )
+                user32.SetWindowPos(
+                    hwnd,
+                    HWND_NOTOPMOST,
+                    0,
+                    0,
+                    0,
+                    0,
+                    SWP_NOMOVE | SWP_NOSIZE,
+                )
+
+                user32.SetForegroundWindow(hwnd)
+
+            finally:
+                if attached:
+                    user32.AttachThreadInput(
+                        foreground_thread,
+                        target_thread,
+                        False,
+                    )
+
+            _time.sleep(0.35)
+
+            if user32.GetForegroundWindow() == hwnd or self._foreground_is_browser():
+                _time.sleep(0.2)
+                return True
+
+            # Alt-key nudge: releases Windows' foreground lock so the
+            # next SetForegroundWindow is allowed.
+            user32.keybd_event(0x12, 0, 0, 0)
+            user32.keybd_event(0x12, 0, 2, 0)
+
+        return self._foreground_is_browser()
+
+    def _foreground_is_browser(self) -> bool:
+        """
+        True when the current foreground window belongs to a browser
+        process. If the user is already looking at some browser window,
+        operating on it is the sensible behavior even when the exact
+        target hwnd could not be focused.
+        """
+
+        import ctypes
+        import win32process
+        import psutil
+
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+
+        if not hwnd:
+            return False
+
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+
+            return psutil.Process(pid).name().lower() in self._BROWSER_EXES
+
+        except Exception:
+            return False
+
+    def navigate(self, url: str) -> dict:
+        url = (url or "").strip()
+
+        if not url:
+            return {
+                "success": False,
+                "error": "No URL was provided.",
+            }
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available to navigate.",
+            }
+
+        target = self._normalize_url(url)
+
+        # Open a NEW tab first so the user's current tab (e.g. their
+        # Instagram) is never hijacked by our navigation.
+        self._combo(self.VK_CONTROL, ord("T"))
+        time.sleep(0.4)
+
+        # Focus the address bar, type the target, press Enter.
+        self._combo(self.VK_CONTROL, ord("L"))
+        time.sleep(0.3)
+
+        self.controller.type_text(target, interval=0.01)
+        time.sleep(0.2)
+
+        # Kill Chrome's inline autocomplete BEFORE Enter: the address
+        # bar auto-appends a highlighted suffix from history (e.g.
+        # typing youtube.com completes to a previously-visited watch
+        # URL) and Enter would accept the hijacked address. Delete
+        # clears any selected completion; typing already ends clean.
+        self._tap(self.VK_DELETE)
+        time.sleep(0.1)
+
+        self._tap(self.VK_RETURN)
+
+        # ------------------------------------------------
+        # VERIFICATION: read the tab URL back and compare.
+        # ------------------------------------------------
+        time.sleep(2.0)
+
+        verification = self.tab_state()
+
+        final_url = (
+            verification.get("url", "")
+            if isinstance(verification, dict)
+            else ""
+        )
+
+        if not final_url:
+            # One retry: page load or clipboard read can race.
+            time.sleep(1.5)
+            verification = self.tab_state()
+
+            final_url = (
+                verification.get("url", "")
+                if isinstance(verification, dict)
+                else ""
+            )
+
+        if final_url:
+            landed = self._same_site(final_url, target)
+
+            # Cold-start race: the browser was still initializing when
+            # our keystrokes arrived (e.g. sitting on chrome://whats-new).
+            # Retry once after letting it settle.
+            if not landed:
+                time.sleep(2.0)
+
+                self._combo(self.VK_CONTROL, ord("T"))
+                time.sleep(0.5)
+                self._combo(self.VK_CONTROL, ord("L"))
+                time.sleep(0.3)
+                self.controller.type_text(target, interval=0.01)
+                time.sleep(0.2)
+                self._tap(self.VK_DELETE)
+                time.sleep(0.1)
+                self._tap(self.VK_RETURN)
+                time.sleep(2.5)
+
+                verification = self.tab_state()
+
+                final_url = (
+                    verification.get("url", "")
+                    if isinstance(verification, dict)
+                    else ""
+                )
+
+                if final_url:
+                    landed = self._same_site(final_url, target)
+
+            return {
+                "success": landed,
+                "url": final_url,
+                "verified": True,
+                "message": (
+                    f"Navigated to {final_url}."
+                    if landed
+                    else (
+                        f"I typed the address but the browser is on "
+                        f"{final_url} instead."
+                    )
+                ),
+            }
+
+        # Could not verify (clipboard/read failure): report without
+        # claiming verified success.
+        return {
+            "success": True,
+            "verified": False,
+            "message": f"I navigated to {target}, but couldn't verify the page.",
+        }
+
+    @staticmethod
+    def _same_site(actual: str, target: str) -> bool:
+        """True when actual URL matches the target's host (and path prefix)."""
+
+        from urllib.parse import urlparse
+
+        try:
+            actual_host = urlparse(actual).netloc.lower()
+            target_host = urlparse(target).netloc.lower()
+
+            if not target_host:
+                return False
+
+            # Treat www.example.com and example.com as equal.
+            normalize = lambda host: host[4:] if host.startswith("www.") else host
+
+            return normalize(actual_host) == normalize(target_host)
+
+        except Exception:
+            return False
+
+    def refresh(self) -> dict:
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available to refresh.",
+            }
+
+        self.controller.press_key("f5")
+
+        return {
+            "success": True,
+            "message": "Refreshed the page.",
+        }
+
+    def back(self) -> dict:
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        self._combo(self.VK_MENU, self.VK_LEFT)
+
+        return {
+            "success": True,
+            "message": "Went back one page.",
+        }
+
+    def forward(self) -> dict:
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        self._combo(self.VK_MENU, self.VK_RIGHT)
+
+        return {
+            "success": True,
+            "message": "Went forward one page.",
+        }
+
+    def read(self, max_chars: int = 4000) -> dict:
+        """Copy the selectable page text via the clipboard."""
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available to read.",
+            }
+
+        previous = self._clipboard_text()
+
+        # Empty the clipboard first: any text found after the copy is
+        # guaranteed to be fresh page content, never stale clipboard.
+        self._restore_clipboard("")
+
+        self._combo(self.VK_CONTROL, ord("A"))
+        time.sleep(0.2)
+
+        self._combo(self.VK_CONTROL, ord("C"))
+        time.sleep(0.4)
+
+        text = self._clipboard_text()
+
+        self._restore_clipboard(previous)
+        self._tap(self.VK_ESCAPE)
+
+        if not text:
+            return {
+                "success": False,
+                "error": (
+                    "The page provided no selectable text. "
+                    "It may be empty, an image, or a protected view."
+                ),
+            }
+
+        text = text.strip()
+
+        return {
+            "success": True,
+            "text": text[:max_chars],
+            "message": text[:600] + ("..." if len(text) > 600 else ""),
+        }
+
+    def tab_state(self) -> dict:
+        """Return the URL of the active tab via the clipboard."""
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        previous = self._clipboard_text()
+
+        self._restore_clipboard("")
+
+        self._combo(self.VK_CONTROL, ord("L"))
+        time.sleep(0.2)
+
+        self._combo(self.VK_CONTROL, ord("C"))
+        time.sleep(0.3)
+
+        url = self._clipboard_text()
+
+        self._tap(self.VK_ESCAPE)
+        self._restore_clipboard(previous)
+
+        if not url:
+            return {
+                "success": False,
+                "error": "Could not read the active tab URL.",
+            }
+
+        return {
+            "success": True,
+            "url": url.strip(),
+            "message": f"The active tab is {url.strip()}.",
+        }
+
+    def type_text(self, text: str, press_enter: bool = False) -> dict:
+        """Type into the currently focused element of the page."""
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        if not text:
+            return {
+                "success": False,
+                "error": "No text was provided.",
+            }
+
+        self.controller.type_text(text, interval=0.01)
+
+        if press_enter:
+            time.sleep(0.1)
+            self._tap(self.VK_RETURN)
+
+        return {
+            "success": True,
+            "message": f"Typed {len(text)} characters.",
+        }
+
+    def scroll(self, amount: int = 3) -> dict:
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        self.controller.scroll_mouse(int(amount) * 120)
+
+        return {
+            "success": True,
+            "message": "Scrolled the page.",
+        }
+
+    def click_target(self, target: str) -> dict:
+        """
+        Click a described element on the active browser page using
+        screen vision to find its coordinates.
+        """
+
+        from tools.screen_vision import ScreenVision
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available to click in.",
+            }
+
+        try:
+            vision = ScreenVision()
+        except ValueError:
+            return {
+                "success": False,
+                "error": "Vision model is not configured.",
+            }
+
+        located = vision.locate(
+            f"On the webpage currently shown, locate this element: {target}. "
+            "Return the center of the clickable element (button, link, or control)."
+        )
+
+        if not located.get("success"):
+            return {
+                "success": False,
+                "error": (
+                    f"I couldn't find '{target}' on the current page."
+                ),
+            }
+
+        self.controller.move_mouse(located["x"], located["y"])
+        time.sleep(0.2)
+        self.controller.click_mouse("left")
+
+        return {
+            "success": True,
+            "x": located["x"],
+            "y": located["y"],
+            "message": f"Clicked {target}.",
+        }
+
+    def copy_target(self, target: str = None) -> dict:
+        """
+        Copy text from the active page to the clipboard and return it.
+        With a target, clicks the described element first (selecting or
+        focusing it); without, copies the selectable page text.
+        """
+
+        if not self.focus_browser():
+            return {
+                "success": False,
+                "error": "No browser window is available.",
+            }
+
+        previous = self._clipboard_text()
+
+        # Empty-first: guarantees fresh copy, never stale clipboard.
+        self._restore_clipboard("")
+
+        if target:
+            self.click_target(target)
+            time.sleep(0.3)
+
+        self._combo(self.VK_CONTROL, ord("A"))
+        time.sleep(0.2)
+        self._combo(self.VK_CONTROL, ord("C"))
+        time.sleep(0.5)
+
+        text = self._clipboard_text()
+
+        self._restore_clipboard(previous)
+        self._tap(self.VK_ESCAPE)
+
+        return {
+            "success": bool(text),
+            "text": text[:4000],
+            "message": (
+                text[:400] + ("..." if len(text) > 400 else "")
+                if text
+                else "Nothing could be copied."
+            ),
+        }
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    # Site-native search endpoints: searching a site means opening
+    # ITS search page, never a random result link.
+    _SEARCH_ENDPOINTS = {
+        "youtube": "https://www.youtube.com/results?search_query={}",
+        "google": "https://www.google.com/search?q={}",
+        "github": "https://github.com/search?q={}",
+        "wikipedia": "https://en.wikipedia.org/w/index.php?search={}",
+        "amazon": "https://www.amazon.in/s?k={}",
+        "reddit": "https://www.reddit.com/search/?q={}",
+        "twitter": "https://twitter.com/search?q={}",
+        "x": "https://twitter.com/search?q={}",
+        "stack overflow": "https://stackoverflow.com/search?q={}",
+        "stackoverflow": "https://stackoverflow.com/search?q={}",
+        "flipkart": "https://www.flipkart.com/search?q={}",
+    }
+
+    def search_site(self, site: str, query: str) -> dict:
+        """
+        Search ON a named site by opening that site's own search page.
+        Falls back to a Google site-restricted search for unknown sites.
+        """
+
+        site = (site or "").strip().lower()
+        query = (query or "").strip()
+
+        if not query:
+            return {
+                "success": False,
+                "error": "No search query was provided.",
+            }
+
+        from urllib.parse import quote
+
+        endpoint = self._SEARCH_ENDPOINTS.get(site)
+
+        if endpoint:
+            url = endpoint.format(quote(query))
+            display = site
+        else:
+            url = (
+                "https://www.google.com/search?q="
+                + quote(f"site:{site} {query}")
+                if site
+                else "https://www.google.com/search?q=" + quote(query)
+            )
+
+            display = site or "the web"
+
+        result = self.navigate(url)
+
+        if result.get("success"):
+            result["message"] = (
+                f"Searching {display} for {query}."
+            )
+
+        return result
+
+    @staticmethod
+    def _normalize_url(url: str) -> str:
+        url = url.strip()
+
+        # Has a scheme already.
+        if re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", url):
+            return url
+
+        # Looks like a domain (e.g. "example.com/docs").
+        if re.match(r"^[\w-]+(\.[\w-]+)+(/|$)", url):
+            return "https://" + url
+
+        # Not a URL: treat it as a web search.
+        from urllib.parse import quote
+
+        return "https://duckduckgo.com/?q=" + quote(url)
+
+    def _combo(self, modifier_vk: int, key_vk: int):
+        self._key_down(modifier_vk)
+        self._key_down(key_vk)
+        self._key_up(key_vk)
+        self._key_up(modifier_vk)
+
+    def _tap(self, vk: int):
+        self._key_down(vk)
+        self._key_up(vk)
+
+    KEYEVENTF_KEYUP = 0x0002
+    KEYEVENTF_SCANCODE = 0x0008
+    KEYEVENTF_UNICODE = 0x0004
+    INPUT_KEYBOARD = 1
+
+    def _send_scan(self, vk: int, keyup: bool = False):
+        """Send a key via SendInput with scan code (Chromium-safe)."""
+
+        import ctypes
+
+        scan = ctypes.windll.user32.MapVirtualKeyW(vk, 0)
+
+        flags = self.KEYEVENTF_SCANCODE
+
+        if keyup:
+            flags |= self.KEYEVENTF_KEYUP
+
+        class KEYBDINPUT(ctypes.Structure):
+            _fields_ = [
+                ("wVk", ctypes.c_ushort),
+                ("wScan", ctypes.c_ushort),
+                ("dwFlags", ctypes.c_ulong),
+                ("time", ctypes.c_ulong),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class INPUT(ctypes.Structure):
+            _fields_ = [
+                ("type", ctypes.c_ulong),
+                ("ki", KEYBDINPUT),
+                ("padding", ctypes.c_ubyte * 8),
+            ]
+
+        item = INPUT()
+        item.type = self.INPUT_KEYBOARD
+        item.ki = KEYBDINPUT(0, scan, flags, 0, None)
+
+        ctypes.windll.user32.SendInput(1, ctypes.byref(item), ctypes.sizeof(INPUT))
+
+    def _key_down(self, vk: int):
+        self._send_scan(vk, keyup=False)
+
+    def _key_up(self, vk: int):
+        self._send_scan(vk, keyup=True)
+
+    def _clipboard_text(self) -> str:
+        try:
+            win32clipboard.OpenClipboard()
+
+            try:
+                if win32clipboard.IsClipboardFormatAvailable(
+                    win32clipboard.CF_UNICODETEXT
+                ):
+                    return win32clipboard.GetClipboardData(
+                        win32clipboard.CF_UNICODETEXT
+                    )
+
+                return ""
+            finally:
+                win32clipboard.CloseClipboard()
+
+        except Exception:
+            return ""
+
+    def _restore_clipboard(self, text: str):
+        try:
+            win32clipboard.OpenClipboard()
+            win32clipboard.EmptyClipboard()
+
+            try:
+                win32clipboard.SetClipboardText(
+                    text,
+                    win32clipboard.CF_UNICODETEXT,
+                )
+            finally:
+                win32clipboard.CloseClipboard()
+
+        except Exception:
+            pass
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\browser_detector.py =====
+
+import re
+import winreg
+
+
+class BrowserDetector:
+    REGISTRY_PATH = r"SOFTWARE\Clients\StartMenuInternet"
+
+    def discover_browsers(self):
+        browsers = {}
+
+        registry_locations = [
+            winreg.HKEY_LOCAL_MACHINE,
+            winreg.HKEY_CURRENT_USER,
+        ]
+
+        for root in registry_locations:
+            try:
+                with winreg.OpenKey(
+                    root,
+                    self.REGISTRY_PATH,
+                ) as registry_key:
+
+                    index = 0
+
+                    while True:
+                        try:
+                            browser_name = winreg.EnumKey(
+                                registry_key,
+                                index,
+                            )
+
+                            index += 1
+
+                            executable = self._get_executable(
+                                root,
+                                browser_name,
+                            )
+
+                            if executable:
+                                key = browser_name.lower()
+
+                                browsers[key] = {
+                                    "name": browser_name,
+                                    "executable": executable,
+                                }
+
+                        except OSError:
+                            break
+
+            except OSError:
+                continue
+
+        return browsers
+
+    def _get_executable(self, root, browser_name):
+        command_path = (
+            self.REGISTRY_PATH
+            + "\\"
+            + browser_name
+            + r"\shell\open\command"
+        )
+
+        try:
+            with winreg.OpenKey(
+                root,
+                command_path,
+            ) as command_key:
+
+                command, _ = winreg.QueryValueEx(
+                    command_key,
+                    "",
+                )
+
+        except OSError:
+            return None
+
+        return self._extract_executable(command)
+
+    def _extract_executable(self, command):
+        command = command.strip()
+
+        match = re.match(
+            r'^"([^"]+\.exe)"',
+            command,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return match.group(1)
+
+        match = re.search(
+            r'(.+?\.exe)(?:\s|$)',
+            command,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return match.group(1)
+
+        return None
+
+
+if __name__ == "__main__":
+    detector = BrowserDetector()
+
+    browsers = detector.discover_browsers()
+
+    print("BROWSER DISCOVERY READY")
+    print()
+    print(f"Browsers found: {len(browsers)}")
+    print()
+
+    for browser in sorted(
+        browsers.values(),
+        key=lambda item: item["name"].lower(),
+    ):
+        print(
+            f"- {browser['name']} -> "
+            f"{browser['executable']}"
+        )
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\browser_observer.py =====
+
+from pathlib import Path
+
+from tools.profiles import UserDataDirectoryFinder
+from tools.browser_detector import BrowserDetector
+
+
+class BrowserObserver:
+    def __init__(self):
+        self.detector = BrowserDetector()
+        self.user_data_finder = UserDataDirectoryFinder()
+
+    def inspect_browser(self, browser_name: str):
+        browser = self._find_browser(browser_name)
+
+        if browser is None:
+            return {
+                "success": False,
+                "error": f"Browser '{browser_name}' was not found.",
+            }
+
+        user_data_directory = self.user_data_finder.find_for_browser(
+            browser["name"],
+            browser["executable"],
+        )
+
+        if user_data_directory is None:
+            return {
+                "success": False,
+                "error": f"Could not locate the profile data for {browser['name']}.",
+            }
+
+        user_data_directory = Path(user_data_directory)
+
+        return {
+            "success": True,
+            "browser": browser["name"],
+            "executable": browser["executable"],
+            "user_data_directory": str(user_data_directory),
+            "files": self._list_relevant_files(user_data_directory),
+        }
+
+    def _find_browser(self, name: str):
+        browsers = self.detector.discover_browsers()
+        requested = name.lower().strip()
+
+        if requested in browsers:
+            return browsers[requested]
+
+        matches = [
+            browser
+            for browser_name, browser in browsers.items()
+            if requested in browser_name
+            or browser_name in requested
+        ]
+
+        if len(matches) == 1:
+            return matches[0]
+
+        return None
+
+    def _list_relevant_files(self, user_data_directory: Path):
+        relevant_names = {
+            "Local State",
+            "History",
+            "Current Session",
+            "Current Tabs",
+            "Last Session",
+            "Last Tabs",
+        }
+
+        found = []
+
+        for path in user_data_directory.rglob("*"):
+            if not path.is_file():
+                continue
+
+            if path.name in relevant_names:
+                found.append(str(path))
+
+        return found
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\capabilities.py =====
+
+"""
+Canonical capability definitions for JARVIS.
+
+A capability describes the TYPE OF OPERATION a user request requires,
+not the specific tool that will execute it. The capability router
+(router/capability_router_v2.py) classifies requests into these
+capabilities; tool selection happens later, in the agent/planner layer.
+
+Routing logic does NOT belong in this module.
+"""
+
+# ============================================================
+# CAPABILITY DEFINITIONS
+# ============================================================
+
+CAPABILITIES = {
+    "application": {
+        "description": (
+            "Launch, open, close, switch to, or bring up desktop "
+            "applications."
+        ),
+        "examples": [
+            "open VS Code",
+            "launch Chrome",
+            "close Spotify",
+            "bring Calculator to the front",
+        ],
+    },
+
+    "browser": {
+        "description": (
+            "Interact with a web browser or webpage: navigation, webpage "
+            "interaction, reading webpage content, browser-specific "
+            "actions, and named-website interaction."
+        ),
+        "examples": [
+            "go to YouTube in Chrome",
+            "click the search button on a webpage",
+            "navigate back",
+            "read the webpage",
+        ],
+    },
+
+    "computer": {
+        "description": (
+            "Generic mouse and keyboard interaction with ordinary desktop "
+            "applications. Only used when the user explicitly requests "
+            "that interaction, never because another capability uses "
+            "mouse/keyboard internally."
+        ),
+        "examples": [
+            "move the mouse",
+            "click a desktop button",
+            "type hello",
+            "press Enter",
+            "scroll down",
+        ],
+    },
+
+    "filesystem": {
+        "description": (
+            "File and folder operations: find, locate, read, create, "
+            "copy, move, rename, delete, inspect, and access."
+        ),
+        "examples": [
+            "find my physics notes",
+            "read notes.txt",
+            "move this file",
+            "open the folder containing my project",
+        ],
+    },
+
+    "screen": {
+        "description": (
+            "Visual inspection of what is currently displayed on the "
+            "screen: screenshots, visible content, and appearance."
+        ),
+        "examples": [
+            "take a screenshot",
+            "what is visible on my screen?",
+            "what does this look like?",
+        ],
+    },
+
+    "web": {
+        "description": (
+            "Retrieve information from the internet without requiring "
+            "browser UI control: online search, research, news, facts, "
+            "and documentation retrieval."
+        ),
+        "examples": [
+            "search the internet for the latest Python release",
+            "find information about the James Webb Telescope",
+        ],
+    },
+
+    "system": {
+        "description": (
+            "Operating-system and hardware control or information: "
+            "volume, brightness, battery, CPU, RAM, storage, network, "
+            "Wi-Fi, Bluetooth, lock, sleep, restart, shutdown."
+        ),
+        "examples": [
+            "set volume to 40%",
+            "check battery",
+            "how much RAM am I using?",
+            "turn Bluetooth on",
+        ],
+    },
+
+    "memory": {
+        "description": (
+            "Persistent user information: remember, recall, update, and "
+            "forget. Not the same as saved workflows."
+        ),
+        "examples": [
+            "remember that I prefer dark mode",
+            "what do you remember about my projects?",
+            "forget my old preference",
+        ],
+    },
+
+    "skill": {
+        "description": (
+            "Reusable JARVIS skills/workflows: discover, create, "
+            "validate, run, and manage saved routines. Only involved "
+            "when the user explicitly refers to a reusable or saved "
+            "workflow."
+        ),
+        "examples": [
+            "create a morning study routine",
+            "run my saved study routine",
+        ],
+    },
+}
+
+# Canonical, deterministic ordering for the final capability list.
+CAPABILITY_ORDER = [
+    "application",
+    "browser",
+    "computer",
+    "filesystem",
+    "screen",
+    "web",
+    "system",
+    "memory",
+    "skill",
+]
+
+# Convenience tuple of all capability names (canonical order).
+CAPABILITY_NAMES = tuple(CAPABILITY_ORDER)
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def get_capability_names() -> list:
+    """Return all capability names in canonical order."""
+    return list(CAPABILITY_ORDER)
+
+
+def get_capability(name) -> dict:
+    """Return the definition for a capability, or None if unknown."""
+    return CAPABILITIES.get(name)
+
+
+def is_valid_capability(name) -> bool:
+    """Return True if name is a known capability."""
+    return name in CAPABILITIES
+
+
+def validate_capabilities(capabilities) -> list:
+    """
+    Validate, deduplicate, and order a capability list.
+
+    - Unknown capability names are rejected.
+    - Duplicates are removed.
+    - The canonical order is preserved.
+    """
+    seen = set()
+    validated = []
+
+    for capability in capabilities:
+        if not isinstance(capability, str):
+            continue
+
+        if not is_valid_capability(capability):
+            continue
+
+        if capability in seen:
+            continue
+
+        seen.add(capability)
+        validated.append(capability)
+
+    return sorted(validated, key=CAPABILITY_ORDER.index)
+
+
+# ============================================================
+# LEGACY: INTENT-LEVEL REGISTRY
+# ============================================================
+#
+# The IntentEngine (assistant/intent_engine.py) still classifies
+# requests into legacy intent-level capabilities such as
+# "lock_laptop" or "volume_up". That registry lives here until the
+# intent system is retired; it is NOT the capability model above.
+
+class CapabilityRegistry:
+    def __init__(self):
+        self.capabilities = {
+            "lock_laptop": {
+                "description": "Lock the Windows laptop.",
+                "risk": "high",
+                "confirmation_required": True,
+            },
+
+            "sleep_laptop": {
+                "description": "Put the Windows laptop to sleep.",
+                "risk": "high",
+                "confirmation_required": True,
+            },
+
+            "restart_laptop": {
+                "description": "Restart the Windows laptop.",
+                "risk": "high",
+                "confirmation_required": True,
+            },
+
+            "shutdown_laptop": {
+                "description": "Shut down the Windows laptop.",
+                "risk": "high",
+                "confirmation_required": True,
+            },
+
+            "volume_up": {
+                "description": "Increase the system volume.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "volume_down": {
+                "description": "Decrease the system volume.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "set_volume": {
+                "description": "Set the system volume to a percentage.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "volume_mute": {
+                "description": "Mute system audio.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "volume_unmute": {
+                "description": "Unmute system audio.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "open_application": {
+                "description": "Open an installed application.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "open_browser": {
+                "description": (
+                    "Open an installed web browser, optionally using a "
+                    "specific browser profile."
+                ),
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "open_browser_profile": {
+                "description": (
+                    "Open an installed web browser using a specific "
+                    "browser profile."
+                ),
+                "risk": "low",
+                "confirmation_required": False,
+            },
+
+            "take_screenshot": {
+                "description": "Capture an image of the current screen.",
+                "risk": "low",
+                "confirmation_required": False,
+            },
+        }
+
+    def exists(self, capability_name) -> bool:
+        return capability_name in self.capabilities
+
+    def get(self, capability_name):
+        return self.capabilities.get(capability_name)
+
+    def all(self):
+        return self.capabilities.copy()
+
+
+class LegacyKeywordRouter:
+    """
+    LEGACY keyword-based category detector (was CapabilityRouter).
+
+    Kept only for backward compatibility. The hybrid router in
+    router/capability_router_v2.py supersedes this class.
+    """
+
+    CATEGORY_KEYWORDS = {
+        "computer": {
+            "mouse", "cursor", "click", "scroll", "keyboard", "type",
+            "press", "key", "active window", "running apps",
+            "running applications",
+        },
+
+        "application": {
+            "open app", "open application", "launch app",
+            "launch application", "start app", "start application",
+            "close app", "close application", "quit app",
+            "quit application", "application", "app",
+        },
+
+        "browser": {
+            "browser", "chrome", "comet", "edge", "opera", "opera gx",
+            "firefox", "youtube", "website", "webpage", "url", "tab",
+            "navigate", "search online",
+        },
+
+        "filesystem": {
+            "file", "files", "folder", "folders", "directory",
+            "directories", "document", "documents", "pdf", "notes",
+            "resume", "delete file", "delete folder", "copy file",
+            "move file", "read file", "open file",
+        },
+
+        "system": {
+            "volume", "sound", "mute", "brightness", "battery", "cpu",
+            "processor", "ram", "memory", "storage", "disk", "wifi",
+            "wi-fi", "bluetooth", "network", "restart", "shutdown",
+            "shut down", "sleep", "lock laptop", "lock computer",
+        },
+
+        "screen": {
+            "screenshot", "screen", "what is on my screen",
+            "look at my screen", "analyze my screen",
+        },
+
+        "web": {
+            "web search", "search the web", "internet search",
+            "search online", "fetch webpage",
+        },
+
+        "memory": {
+            "remember", "remember this", "recall",
+            "what did i tell you", "forget",
+        },
+
+        "skill": {
+            "skill", "workflow", "routine",
+        },
+    }
+
+    def detect(self, user_input) -> list:
+        """Return relevant capability categories for a user request."""
+        text = user_input.lower().strip()
+
+        if not text:
+            return []
+
+        detected = []
+
+        for category, keywords in self.CATEGORY_KEYWORDS.items():
+            for keyword in keywords:
+                if keyword in text:
+                    detected.append(category)
+                    break
+
+        return detected
+
+
+# Backward-compatible alias for existing imports.
+CapabilityRouter = LegacyKeywordRouter
+
+
+if __name__ == "__main__":
+    registry = CapabilityRegistry()
+
+    print("CAPABILITIES:")
+
+    for name, capability in CAPABILITIES.items():
+        print(f"- {name}: {capability['description']}")
+
+    print()
+    print("LEGACY INTENT CAPABILITIES:")
+
+    for name, capability in registry.all().items():
+        print(
+            f"- {name}: "
+            f"{capability['description']} "
+            f"[risk={capability['risk']}]"
+        )
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\computer_controller.py =====
+
+import ctypes
+import time
+
+
+class ComputerController:
+    MOUSEEVENTF_MOVE = 0x0001
+    MOUSEEVENTF_LEFTDOWN = 0x0002
+    MOUSEEVENTF_LEFTUP = 0x0004
+    MOUSEEVENTF_RIGHTDOWN = 0x0008
+    MOUSEEVENTF_RIGHTUP = 0x0010
+    MOUSEEVENTF_WHEEL = 0x0800
+
+    KEYEVENTF_KEYUP = 0x0002
+
+    VK_SHIFT = 0x10
+    VK_CTRL = 0x11
+    VK_ALT = 0x12
+    VK_ENTER = 0x0D
+    VK_ESCAPE = 0x1B
+    VK_TAB = 0x09
+    VK_SPACE = 0x20
+    VK_BACKSPACE = 0x08
+    VK_DELETE = 0x2E
+    VK_UP = 0x26
+    VK_DOWN = 0x28
+    VK_LEFT = 0x25
+    VK_RIGHT = 0x27
+
+    def move_mouse(self, x: int, y: int):
+        ctypes.windll.user32.SetCursorPos(x, y)
+
+        return {
+            "success": True,
+            "x": x,
+            "y": y,
+        }
+
+    def click_mouse(self, button: str = "left"):
+        button = button.lower().strip()
+
+        buttons = {
+            "left": (
+                self.MOUSEEVENTF_LEFTDOWN,
+                self.MOUSEEVENTF_LEFTUP,
+            ),
+            "right": (
+                self.MOUSEEVENTF_RIGHTDOWN,
+                self.MOUSEEVENTF_RIGHTUP,
+            ),
+        }
+
+        if button not in buttons:
+            return {
+                "success": False,
+                "error": f"Unsupported mouse button: {button}",
+            }
+
+        down, up = buttons[button]
+
+        ctypes.windll.user32.mouse_event(
+            down,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        ctypes.windll.user32.mouse_event(
+            up,
+            0,
+            0,
+            0,
+            0,
+        )
+
+        return {
+            "success": True,
+            "button": button,
+        }
+
+    def scroll_mouse(self, amount: int):
+        ctypes.windll.user32.mouse_event(
+            self.MOUSEEVENTF_WHEEL,
+            0,
+            0,
+            amount,
+            0,
+        )
+
+        return {
+            "success": True,
+            "amount": amount,
+        }
+
+    def type_text(self, text: str, interval: float = 0.01):
+        if not text:
+            return {
+                "success": False,
+                "error": "No text provided.",
+            }
+
+        for character in text:
+            self._type_character(character)
+
+            if interval > 0:
+                time.sleep(interval)
+
+        return {
+            "success": True,
+            "text_length": len(text),
+        }
+
+    def press_key(self, key: str):
+        virtual_key = self._get_virtual_key(key)
+
+        if virtual_key is None:
+            return {
+                "success": False,
+                "error": f"Unsupported key: {key}",
+            }
+
+        ctypes.windll.user32.keybd_event(
+            virtual_key,
+            0,
+            0,
+            0,
+        )
+
+        ctypes.windll.user32.keybd_event(
+            virtual_key,
+            0,
+            self.KEYEVENTF_KEYUP,
+            0,
+        )
+
+        return {
+            "success": True,
+            "key": key,
+        }
+
+    def _type_character(self, character: str):
+        scan_code = ctypes.windll.user32.VkKeyScanW(
+            ord(character)
+        )
+
+        if scan_code == -1:
+            return
+
+        virtual_key = scan_code & 0xFF
+        shift_state = (scan_code >> 8) & 0xFF
+
+        if shift_state & 1:
+            self._key_down(self.VK_SHIFT)
+
+        self._key_down(virtual_key)
+        self._key_up(virtual_key)
+
+        if shift_state & 1:
+            self._key_up(self.VK_SHIFT)
+
+    def _key_down(self, virtual_key):
+        ctypes.windll.user32.keybd_event(
+            virtual_key,
+            0,
+            0,
+            0,
+        )
+
+    def _key_up(self, virtual_key):
+        ctypes.windll.user32.keybd_event(
+            virtual_key,
+            0,
+            self.KEYEVENTF_KEYUP,
+            0,
+        )
+
+    def _get_virtual_key(self, key: str):
+        key = key.lower().strip()
+
+        special_keys = {
+            "enter": self.VK_ENTER,
+            "return": self.VK_ENTER,
+            "escape": self.VK_ESCAPE,
+            "esc": self.VK_ESCAPE,
+            "tab": self.VK_TAB,
+            "space": self.VK_SPACE,
+            "backspace": self.VK_BACKSPACE,
+            "delete": self.VK_DELETE,
+            "up": self.VK_UP,
+            "down": self.VK_DOWN,
+            "left": self.VK_LEFT,
+            "right": self.VK_RIGHT,
+            "shift": self.VK_SHIFT,
+            "ctrl": self.VK_CTRL,
+            "control": self.VK_CTRL,
+            "alt": self.VK_ALT,
+        }
+
+        if key in special_keys:
+            return special_keys[key]
+
+        if len(key) == 1:
+            return ord(key.upper())
+
+        if key.startswith("f") and key[1:].isdigit():
+            number = int(key[1:])
+
+            if 1 <= number <= 12:
+                return 0x70 + number - 1
+
+        return None
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\computer_observer.py =====
+
+import ctypes
+from ctypes import wintypes
+
+import psutil
+
+
+class ComputerObserver:
+    def get_active_window(self):
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+
+        if not hwnd:
+            return {
+                "success": False,
+                "error": "No active window found.",
+            }
+
+        length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+
+        if length == 0:
+            title = ""
+        else:
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            ctypes.windll.user32.GetWindowTextW(
+                hwnd,
+                buffer,
+                length + 1,
+            )
+            title = buffer.value
+
+        process_id = wintypes.DWORD()
+
+        ctypes.windll.user32.GetWindowThreadProcessId(
+            hwnd,
+            ctypes.byref(process_id),
+        )
+
+        try:
+            process = psutil.Process(process_id.value)
+
+            return {
+                "success": True,
+                "title": title,
+                "process": process.name(),
+                "pid": process.pid,
+            }
+
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            return {
+                "success": True,
+                "title": title,
+                "process": "Unknown",
+                "pid": process_id.value,
+            }
+
+    def get_screen_state(self):
+        try:
+            user32 = ctypes.windll.user32
+
+            screen_width = user32.GetSystemMetrics(0)
+            screen_height = user32.GetSystemMetrics(1)
+
+            point = wintypes.POINT()
+
+            if not user32.GetCursorPos(ctypes.byref(point)):
+                return {
+                    "success": False,
+                    "error": "Could not determine cursor position.",
+                }
+
+            active_window = self.get_active_window()
+
+            return {
+                "success": True,
+                "screen": {
+                    "width": screen_width,
+                    "height": screen_height,
+                },
+                "cursor": {
+                    "x": point.x,
+                    "y": point.y,
+                },
+                "active_window": active_window,
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_running_applications(self):
+        applications = {}
+
+        def enum_window_callback(hwnd, _):
+            if not ctypes.windll.user32.IsWindowVisible(hwnd):
+                return True
+
+            length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+
+            if length == 0:
+                return True
+
+            buffer = ctypes.create_unicode_buffer(length + 1)
+
+            ctypes.windll.user32.GetWindowTextW(
+                hwnd,
+                buffer,
+                length + 1,
+            )
+
+            title = buffer.value.strip()
+
+            if not title:
+                return True
+
+            process_id = wintypes.DWORD()
+
+            ctypes.windll.user32.GetWindowThreadProcessId(
+                hwnd,
+                ctypes.byref(process_id),
+            )
+
+            try:
+                process = psutil.Process(process_id.value)
+                process_name = process.name()
+
+                applications[process_id.value] = {
+                    "name": process_name,
+                    "pid": process_id.value,
+                    "window": title,
+                }
+
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+            return True
+
+        callback = ctypes.WINFUNCTYPE(
+            wintypes.BOOL,
+            wintypes.HWND,
+            wintypes.LPARAM,
+        )(enum_window_callback)
+
+        ctypes.windll.user32.EnumWindows(
+            callback,
+            0,
+        )
+
+        return {
+            "success": True,
+            "count": len(applications),
+            "applications": list(applications.values()),
+        }
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\filesystem.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\filesystem_observer.py =====
+
+from pathlib import Path
+from datetime import datetime
+import shutil
+import mimetypes
+import os
+
+
+class FileSystemObserver:
+    def get_info(self, path: str):
+        file_path = Path(path).expanduser()
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "error": f"File or folder not found: {path}",
+            }
+
+        try:
+            stat = file_path.stat()
+            size_bytes = stat.st_size
+
+            return {
+                "success": True,
+                "name": file_path.name,
+                "path": str(file_path.resolve()),
+                "extension": file_path.suffix.lower(),
+                "size_bytes": size_bytes,
+                "size": self._format_size(size_bytes),
+                "created": datetime.fromtimestamp(
+                    stat.st_ctime
+                ).isoformat(),
+                "modified": datetime.fromtimestamp(
+                    stat.st_mtime
+                ).isoformat(),
+                "is_file": file_path.is_file(),
+                "is_directory": file_path.is_dir(),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def read_file(self, path: str, max_chars: int = 100_000):
+        file_path = Path(path).expanduser()
+
+        if not file_path.exists():
+            return {
+                "success": False,
+                "error": f"File not found: {path}",
+            }
+
+        if not file_path.is_file():
+            return {
+                "success": False,
+                "error": f"Path is not a file: {path}",
+            }
+
+        try:
+            content = file_path.read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+
+            truncated = len(content) > max_chars
+
+            if truncated:
+                content = content[:max_chars]
+
+            return {
+                "success": True,
+                "path": str(file_path.resolve()),
+                "content": content,
+                "truncated": truncated,
+            }
+
+        except (OSError, UnicodeError) as error:
+            return {
+                "success": False,
+                "error": f"Could not read file: {error}",
+            }
+
+    def create(
+        self,
+        path: str,
+        content: str = "",
+        directory: bool = False,
+        overwrite: bool = False,
+    ):
+        target = Path(path).expanduser()
+
+        try:
+            if target.exists() and not overwrite:
+                return {
+                    "success": False,
+                    "error": f"Path already exists: {target}",
+                }
+
+            target.parent.mkdir(parents=True, exist_ok=True)
+
+            if directory:
+                target.mkdir(parents=True, exist_ok=True)
+
+                return {
+                    "success": True,
+                    "operation": "create_directory",
+                    "path": str(target.resolve()),
+                }
+
+            target.write_text(
+                content,
+                encoding="utf-8",
+            )
+
+            return {
+                "success": True,
+                "operation": "create_file",
+                "path": str(target.resolve()),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def copy(self, source: str, destination: str):
+        source_path = Path(source).expanduser()
+        destination_path = Path(destination).expanduser()
+
+        if not source_path.exists():
+            return {
+                "success": False,
+                "error": f"Source not found: {source}",
+            }
+
+        try:
+            destination_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            if source_path.is_dir():
+                shutil.copytree(
+                    source_path,
+                    destination_path,
+                    dirs_exist_ok=True,
+                )
+            else:
+                shutil.copy2(
+                    source_path,
+                    destination_path,
+                )
+
+            return {
+                "success": True,
+                "operation": "copy",
+                "source": str(source_path.resolve()),
+                "destination": str(destination_path.resolve()),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def move(self, source: str, destination: str):
+        source_path = Path(source).expanduser()
+        destination_path = Path(destination).expanduser()
+
+        if not source_path.exists():
+            return {
+                "success": False,
+                "error": f"Source not found: {source}",
+            }
+
+        try:
+            destination_path.parent.mkdir(
+                parents=True,
+                exist_ok=True,
+            )
+
+            shutil.move(
+                str(source_path),
+                str(destination_path),
+            )
+
+            return {
+                "success": True,
+                "operation": "move",
+                "source": str(source_path),
+                "destination": str(destination_path.resolve()),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def delete(self, path: str):
+        target = Path(path).expanduser()
+
+        if not target.exists():
+            return {
+                "success": False,
+                "error": f"Path not found: {path}",
+            }
+
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+                operation = "delete_directory"
+            else:
+                target.unlink()
+                operation = "delete_file"
+
+            return {
+                "success": True,
+                "operation": operation,
+                "path": str(target),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_type(self, path: str):
+        target = Path(path).expanduser()
+
+        if not target.exists():
+            return {
+                "success": False,
+                "error": f"Path not found: {path}",
+            }
+
+        mime_type, _ = mimetypes.guess_type(str(target))
+
+        if target.is_dir():
+            file_type = "directory"
+        elif mime_type:
+            file_type = mime_type
+        elif target.suffix:
+            file_type = f"{target.suffix.lower()} file"
+        else:
+            file_type = "unknown"
+
+        return {
+            "success": True,
+            "path": str(target.resolve()),
+            "name": target.name,
+            "extension": target.suffix.lower(),
+            "type": file_type,
+            "is_file": target.is_file(),
+            "is_directory": target.is_dir(),
+        }
+
+    def get_state(self, path: str | None = None):
+        if path:
+            return self.get_info(path)
+
+        home = Path.home()
+
+        return {
+            "success": True,
+            "home": str(home),
+            "desktop": str(home / "Desktop"),
+            "downloads": str(home / "Downloads"),
+            "documents": str(home / "Documents"),
+            "pictures": str(home / "Pictures"),
+            "videos": str(home / "Videos"),
+            "music": str(home / "Music"),
+        }
+
+    def open_path(self, path: str):
+        target = Path(path).expanduser()
+
+        if not target.exists():
+            return {
+                "success": False,
+                "error": f"Path not found: {path}",
+            }
+
+        try:
+            os.startfile(str(target))
+
+            return {
+                "success": True,
+                "path": str(target.resolve()),
+            }
+
+        except OSError as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def _format_size(self, size_bytes: int):
+        units = ["B", "KB", "MB", "GB", "TB"]
+
+        size = float(size_bytes)
+
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.2f} {unit}"
+
+            size /= 1024
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\filesystem_search.py =====
+
+from pathlib import Path
+import re
+
+
+class FileSystemSearcher:
+    def __init__(self):
+        self.default_locations = self._get_default_locations()
+
+    def _get_default_locations(self):
+        home = Path.home()
+
+        locations = [
+            home / "Desktop",
+            home / "Downloads",
+            home / "Documents",
+            home / "Pictures",
+            home / "Videos",
+            home / "Music",
+            home / "Projects",
+        ]
+
+        return [location for location in locations if location.exists()]
+
+    def search(self, query: str, location=None, max_results=10):
+        query = query.lower().strip()
+
+        if not query:
+            return []
+
+        search_locations = []
+
+        if location:
+            location_path = Path(location).expanduser()
+
+            if location_path.exists():
+                search_locations.append(location_path)
+        else:
+            search_locations = self.default_locations
+
+        query_tokens = self._tokenize(query)
+        matches = []
+
+        for root in search_locations:
+            try:
+                for path in root.rglob("*"):
+                    if not path.is_file():
+                        continue
+
+                    # Ignore Python cache files.
+                    if "__pycache__" in path.parts:
+                        continue
+
+                    # Ignore common temporary/build directories.
+                    ignored_directories = {
+                        ".venv",
+                        "node_modules",
+                        ".git",
+                        "dist",
+                        "build",
+                    }
+
+                    if any(
+                        directory in ignored_directories
+                        for directory in path.parts
+                    ):
+                        continue
+
+                    score = self._calculate_score(path, query_tokens)
+
+                    if score > 0:
+                        matches.append(
+                            {
+                                "name": path.name,
+                                "path": str(path.resolve()),
+                                "score": score,
+                            }
+                        )
+
+            except (PermissionError, OSError):
+                continue
+
+        matches.sort(
+            key=lambda item: item["score"],
+            reverse=True,
+        )
+
+        return matches[:max_results]
+
+    def _tokenize(self, text):
+        return [
+            token
+            for token in re.findall(r"[a-zA-Z0-9]+", text.lower())
+            if len(token) >= 2
+        ]
+
+    def _calculate_score(self, path: Path, query_tokens):
+        filename = path.name.lower()
+        stem = path.stem.lower()
+        full_path = str(path).lower()
+
+        score = 0
+
+        for token in query_tokens:
+            # Exact filename/stem matches are highly relevant.
+            if token in stem:
+                score += 10
+
+            elif token in filename:
+                score += 8
+
+            elif token in full_path:
+                score += 3
+
+        # Strong bonus when the complete query matches the filename.
+        normalized_stem = re.sub(
+            r"[_\-]+",
+            " ",
+            stem,
+        )
+
+        normalized_query = " ".join(query_tokens)
+
+        if normalized_query in normalized_stem:
+            score += 20
+
+        # Prefer normal user files over generated/cache files.
+        if path.suffix.lower() in {".pyc", ".tmp", ".log"}:
+            score -= 15
+
+        return score
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\keyboard.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\mouse.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\profiles.py =====
+
+from dataclasses import dataclass
+from pathlib import Path
+import json
+import os
+import re
+
+@dataclass
+class BrowserProfile:
+    name: str
+    directory: str
+    user_data_directory: str
+
+
+class ChromiumProfileResolver:
+    def resolve_profile(self, profiles, requested_name):
+        if not profiles:
+            return None
+
+        requested = requested_name.lower().strip()
+
+        # Words that can wrap the real request: "my personal
+        # profile", "the school one", "my main account".
+        requested = re.sub(
+            r"^(?:the\s+|my\s+)+", "", requested
+        ).strip()
+
+        requested = re.sub(
+            r"\s+(?:one|profile|account|chrome\s+profile)$", "",
+            requested,
+        ).strip()
+
+        default_aliases = {
+            "default",
+            "personal",
+            "main",
+            "my profile",
+            "my account",
+            "my main profile",
+            "my personal profile",
+            "my own profile",
+            "own",
+        }
+
+        if requested in default_aliases:
+            for profile in profiles:
+                if profile.directory.lower() == "default":
+                    return profile
+
+        # Exact discovered profile name
+        for profile in profiles:
+            if profile.name.lower() == requested:
+                return profile
+
+        # Exact profile directory
+        for profile in profiles:
+            if profile.directory.lower() == requested:
+                return profile
+
+        # Natural variations such as:
+        # "school account" -> "School"
+        # "school profile" -> "School"
+        matches = []
+
+        for profile in profiles:
+            profile_name = profile.name.lower().strip()
+
+            if (
+                requested.startswith(profile_name + " ")
+                or requested.endswith(" " + profile_name)
+            ):
+                matches.append(profile)
+
+        if len(matches) == 1:
+            return matches[0]
+
+        # Voice fuzzy match: "personal" -> "Urav Agarwal" when that
+        # is the Default profile's real name, "my college account"
+        # -> "School". A spoken alias rarely equals the stored name,
+        # so rank every profile by word overlap and take a clear
+        # winner only (ambiguous ties return None on purpose).
+        request_words = {
+            word
+            for word in re.findall(r"[a-z0-9]+", requested)
+            if word not in {"profile", "account", "one", "chrome"}
+        }
+
+        scored = []
+
+        for profile in profiles:
+            profile_words = set(
+                re.findall(r"[a-z0-9]+", profile.name.lower())
+            )
+
+            directory_words = set(
+                re.findall(r"[a-z0-9]+", profile.directory.lower())
+            )
+
+            overlap = len(request_words & profile_words)
+            directory_overlap = len(request_words & directory_words)
+
+            if overlap or directory_overlap:
+                scored.append(
+                    (max(overlap, directory_overlap), profile)
+                )
+
+        if scored:
+            scored.sort(key=lambda item: item[0], reverse=True)
+
+            if len(scored) == 1 or scored[0][0] > scored[1][0]:
+                return scored[0][1]
+
+        return None
+    def discover_profiles(self, user_data_directory):
+        user_data_directory = Path(user_data_directory)
+        local_state = user_data_directory / "Local State"
+
+        if not local_state.exists():
+            return []
+
+        try:
+            with local_state.open(
+                "r",
+                encoding="utf-8",
+            ) as file:
+                data = json.load(file)
+
+        except (OSError, json.JSONDecodeError):
+            return []
+
+        profiles = []
+
+        info_cache = (
+            data
+            .get("profile", {})
+            .get("info_cache", {})
+        )
+
+        for directory, info in info_cache.items():
+            name = info.get("name") or directory
+
+            profile_directory = (
+                user_data_directory / directory
+            )
+
+            if not profile_directory.exists():
+                continue
+
+            profiles.append(
+                BrowserProfile(
+                    name=name,
+                    directory=directory,
+                    user_data_directory=str(
+                        user_data_directory
+                    ),
+                )
+            )
+
+        return profiles
+
+class UserDataDirectoryFinder:
+    def __init__(self):
+        self.search_roots = [
+            Path(os.environ.get("LOCALAPPDATA", "")),
+            Path(os.environ.get("APPDATA", "")),
+        ]
+
+    def find_candidates(self):
+        candidates = []
+
+        for root in self.search_roots:
+            if not root.exists():
+                continue
+
+            try:
+                for local_state in root.rglob("Local State"):
+                    if not local_state.is_file():
+                        continue
+
+                    user_data_directory = local_state.parent
+
+                    candidates.append(
+                        user_data_directory
+                    )
+
+            except (PermissionError, OSError):
+                continue
+
+        return candidates
+
+    def find_for_browser(
+        self,
+        browser_name,
+        executable_path,
+    ):
+        candidates = self.find_candidates()
+
+        if not candidates:
+            return None
+
+        browser_tokens = self._tokenize(
+            browser_name
+        )
+
+        executable_tokens = self._tokenize(
+            Path(executable_path).stem
+        )
+
+        best_candidate = None
+        best_score = 0
+
+        for candidate in candidates:
+            score = self._score_candidate(
+                candidate,
+                browser_tokens,
+                executable_tokens,
+            )
+
+            if score > best_score:
+                best_score = score
+                best_candidate = candidate
+
+        if best_score == 0:
+            return None
+
+        return best_candidate
+
+    def _tokenize(self, value):
+        return {
+            token.lower()
+            for token in re.findall(
+                r"[A-Za-z0-9]+",
+                value,
+            )
+            if len(token) > 2
+        }
+
+    def _score_candidate(
+        self,
+        candidate,
+        browser_tokens,
+        executable_tokens,
+    ):
+        candidate_text = str(candidate).lower()
+
+        score = 0
+
+        for token in browser_tokens:
+            if token in candidate_text:
+                score += 2
+
+        for token in executable_tokens:
+            if token in candidate_text:
+                score += 3
+
+        return score
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\registry.py =====
+
+from tools.applications import ApplicationManager
+from tools.system import SystemController
+from tools.screen import ScreenController
+from security.confirmations import ConfirmationManager
+from tools.browsers import BrowserManager
+
+
+
+class ToolRegistry:
+    def __init__(self):
+        self.applications = ApplicationManager()
+        self.system = SystemController()
+        self.confirmations = ConfirmationManager()
+        self.screen = ScreenController()
+        self.browsers = BrowserManager()
+
+    def take_screenshot(self):
+        return self.screen.take_screenshot()
+
+    def open_application(self, name: str) -> bool:
+        return self.applications.open_application(name)
+
+    def open_browser(self, name: str, profile_name=None):
+        return self.browsers.open_browser(
+            name,
+            profile_name,
+        )
+
+    def get_volume(self):
+        return self.system.get_volume()
+
+    def set_volume(self, percentage):
+        return self.system.set_volume(percentage)
+
+    def increase_volume(self, amount=10):
+        return self.system.increase_volume(amount)
+
+    def decrease_volume(self, amount=10):
+        return self.system.decrease_volume(amount)
+
+    def mute(self):
+        return self.system.mute()
+
+    def unmute(self):
+        return self.system.unmute()
+
+    def get_brightness(self):
+        return self.system.get_brightness()
+
+    def set_brightness(self, percentage):
+        return self.system.set_brightness(percentage)
+
+    def increase_brightness(self, amount=10):
+        return self.system.increase_brightness(amount)
+
+    def decrease_brightness(self, amount=10):
+        return self.system.decrease_brightness(amount)
+
+    def battery_status(self):
+        return self.system.battery_status()
+
+    def uptime(self):
+        return self.system.uptime()
+
+    def wifi_status(self):
+        return self.system.wifi_status()
+
+    def bluetooth_status(self):
+        return self.system.bluetooth_status()
+
+    def network_info(self):
+        return self.system.network_info()
+
+    def lock(self):
+        return self.system.lock()
+
+    def sleep(self):
+        return self.system.sleep()
+
+
+if __name__ == "__main__":
+    registry = ToolRegistry()
+
+    print("TOOL REGISTRY READY")
+    print("Available applications:", registry.applications.applications)
+    print("Volume:", registry.get_volume(), "%")
+    print("Brightness:", registry.get_brightness(), "%")
+    print(registry.take_screenshot())
+    print(registry.battery_status())
+    print(registry.uptime())
+    print(registry.wifi_status())
+    print(registry.bluetooth_status())
+    print(registry.network_info())
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\reminders.py =====
+
+"""
+Reminder store and background checker for JARVIS.
+
+Supports "remind me to X at 8 PM" and recurring routines
+("every evening at 9 remind me to ..."). Checked by a daemon thread
+in the Orchestrator; due reminders are spoken and marked done.
+"""
+
+import json
+import os
+import re
+import threading
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+
+
+class ReminderStore:
+    """JSON-file-backed reminders with a background due-checker."""
+
+    def __init__(self, path=None, on_due=None):
+        self.path = Path(path or os.path.join("data", "reminders.json"))
+
+        self.on_due = on_due
+
+        self._lock = threading.Lock()
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._reminders = []
+
+        self._load()
+
+        self._thread = threading.Thread(
+            target=self._loop,
+            daemon=True,
+        )
+
+        self._thread.start()
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def add(self, text: str, when: datetime, recurring=None) -> dict:
+        """Add a reminder. recurring='daily' repeats every day."""
+
+        reminder = {
+            "id": f"rem_{int(time.time() * 1000)}",
+            "text": text.strip(),
+            "due": when.isoformat(),
+            "recurring": recurring,
+            "created_at": time.time(),
+            "done": False,
+        }
+
+        with self._lock:
+            self._reminders.append(reminder)
+            self._save()
+
+        return {
+            "success": True,
+            "reminder": reminder,
+            "message": (
+                f"Reminder set for {when.strftime('%I:%M %p')}: {text.strip()}"
+            ),
+        }
+
+    def pending(self) -> list:
+        with self._lock:
+            return [
+                dict(reminder)
+                for reminder in self._reminders
+                if not reminder.get("done")
+            ]
+
+    def cancel(self, query: str) -> dict:
+        """Cancel the best-matching pending reminder."""
+
+        with self._lock:
+            best = None
+
+            for reminder in self._reminders:
+                if reminder.get("done"):
+                    continue
+
+                text = reminder["text"].lower()
+
+                if query.lower().strip() in text:
+                    best = reminder
+                    break
+
+            if best is None:
+                return {
+                    "success": False,
+                    "error": "No matching reminder was found.",
+                }
+
+            best["done"] = True
+            self._save()
+
+        return {
+            "success": True,
+            "message": f"Cancelled reminder: {best['text']}",
+        }
+
+    # ==================================================
+    # NATURAL LANGUAGE PARSING
+    # ==================================================
+
+    _WEEKDAYS = {
+        "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+        "friday": 4, "saturday": 5, "sunday": 6,
+    }
+
+    def parse_and_add(self, request: str) -> dict:
+        """
+        Parse "remind me to X at 8 PM", "in 20 minutes", "tomorrow at 7",
+        "every evening at 9 remind me to X", weekday names.
+        """
+
+        request = (request or "").strip()
+
+        if not request:
+            return {
+                "success": False,
+                "error": "Nothing to remember to do.",
+            }
+
+        now = datetime.now()
+
+        recurring = None
+
+        if re.search(r"\bevery\s+(day|morning|evening|night)\b", request, re.I):
+            recurring = "daily"
+
+        request_lower = request.lower()
+
+        # Extract the task text.
+        task_match = re.search(
+            r"remind me (?:to |about |that )?(.+?)(?:\s+(?:at|in|every|tomorrow|on)\b|$)",
+            request,
+            re.IGNORECASE,
+        )
+
+        task = task_match.group(1).strip(" .") if task_match else request
+
+        due = None
+
+        # "in N minutes/hours"
+        rel = re.search(
+            r"\bin\s+(\d+)\s+(minute|minutes|min|hour|hours|hrs)\b",
+            request_lower,
+        )
+
+        if rel:
+            amount = int(rel.group(1))
+
+            if rel.group(2).startswith(("hour", "hrs")):
+                due = now + timedelta(hours=amount)
+            else:
+                due = now + timedelta(minutes=amount)
+
+        # "at 8 PM", "at 8:30 pm", "at 20:00"
+        if due is None:
+            at = re.search(
+                r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+                request_lower,
+            )
+
+            if at:
+                hour = int(at.group(1))
+                minute = int(at.group(2) or 0)
+
+                meridiem = at.group(3)
+
+                if meridiem == "pm" and hour < 12:
+                    hour += 12
+                elif meridiem == "am" and hour == 12:
+                    hour = 0
+                elif (
+                    meridiem is None
+                    and hour < 12
+                    and re.search(
+                        r"\b(?:evening|night|tonight)\b",
+                        request_lower,
+                    )
+                ):
+                    # "every evening at 9" means 9 PM.
+                    hour += 12
+
+                due = now.replace(
+                    hour=hour,
+                    minute=minute,
+                    second=0,
+                    microsecond=0,
+                )
+
+                if due <= now:
+                    due += timedelta(days=1)
+
+        # "tomorrow"
+        if due is not None and re.search(r"\btomorrow\b", request_lower):
+            due += timedelta(days=1)
+
+        # Weekday names: "on friday at 6"
+        if due is None:
+            for name, number in self._WEEKDAYS.items():
+                if re.search(rf"\b{name}\b", request_lower):
+                    days_ahead = (number - now.weekday()) % 7
+
+                    if days_ahead == 0:
+                        days_ahead = 7
+
+                    due = (now + timedelta(days=days_ahead)).replace(
+                        hour=18,
+                        minute=0,
+                        second=0,
+                        microsecond=0,
+                    )
+
+                    at = re.search(
+                        r"\bat\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b",
+                        request_lower,
+                    )
+
+                    if at:
+                        hour = int(at.group(1))
+                        minute = int(at.group(2) or 0)
+                        meridiem = at.group(3)
+
+                        if meridiem == "pm" and hour < 12:
+                            hour += 12
+                        elif meridiem == "am" and hour == 12:
+                            hour = 0
+
+                        due = due.replace(hour=hour, minute=minute)
+
+                    break
+
+        if due is None:
+            return {
+                "success": False,
+                "error": (
+                    "I couldn't work out when to remind you. "
+                    "Try 'at 8 PM' or 'in 20 minutes'."
+                ),
+            }
+
+        return self.add(task, due, recurring)
+
+    # ==================================================
+    # BACKGROUND CHECKER
+    # ==================================================
+
+    def _loop(self):
+        while True:
+            try:
+                self._check_due()
+            except Exception:
+                pass
+
+            time.sleep(10)
+
+    def _check_due(self):
+        now = datetime.now()
+
+        with self._lock:
+            due_now = []
+
+            for reminder in self._reminders:
+                if reminder.get("done"):
+                    continue
+
+                try:
+                    due = datetime.fromisoformat(reminder["due"])
+                except (ValueError, KeyError):
+                    continue
+
+                if due <= now:
+                    due_now.append(reminder)
+
+            for reminder in due_now:
+                if reminder.get("recurring") == "daily":
+                    reminder["due"] = (
+                        datetime.fromisoformat(reminder["due"])
+                        + timedelta(days=1)
+                    ).isoformat()
+                else:
+                    reminder["done"] = True
+
+            if due_now:
+                self._save()
+
+        if self.on_due and due_now:
+            for reminder in due_now:
+                try:
+                    self.on_due(
+                        f"Reminder: {reminder['text']}"
+                    )
+                except Exception:
+                    pass
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    def _load(self):
+        if not self.path.exists():
+            return
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if isinstance(data, list):
+                self._reminders = data
+
+        except (json.JSONDecodeError, OSError):
+            self._reminders = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as file:
+                json.dump(self._reminders, file, indent=2)
+
+        except OSError:
+            pass
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\screen.py =====
+
+from io import BytesIO
+import win32clipboard
+from PIL import ImageGrab
+
+
+
+class ScreenController:
+    def take_screenshot(self):
+        screenshot = ImageGrab.grab()
+
+        # Copy screenshot directly to Windows clipboard
+        output = BytesIO()
+        screenshot.convert("RGB").save(output, "BMP")
+
+        bmp_data = output.getvalue()[14:]
+
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(
+                win32clipboard.CF_DIB,
+                bmp_data,
+            )
+        finally:
+            win32clipboard.CloseClipboard()
+
+        return "Screenshot copied to clipboard."
+
+
+if __name__ == "__main__":
+    controller = ScreenController()
+
+    result = controller.take_screenshot()
+
+    print(result)
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\screen_vision.py =====
+
+import base64
+import os
+from io import BytesIO
+
+from dotenv import load_dotenv
+from openai import OpenAI
+from PIL import ImageGrab
+from tools.computer_observer import ComputerObserver
+
+load_dotenv()
+
+
+class ScreenVision:
+    """Analyze the current screen using a multimodal vision model."""
+
+    def __init__(self):
+        api_key = os.getenv("GROQ_API_KEY")
+
+        if not api_key:
+            raise ValueError("GROQ_API_KEY is not set.")
+
+        self.client = OpenAI(
+            base_url="https://api.groq.com/openai/v1",
+            api_key=api_key,
+        )
+
+        self.model = "qwen/qwen3.8-27b"
+
+        self.locate_model = "qwen/qwen3.8-27b"
+
+    def capture_screen(self):
+        screenshot = ImageGrab.grab()
+
+        output = BytesIO()
+        screenshot.convert("RGB").save(
+            output,
+            format="JPEG",
+            quality=85,
+        )
+
+        return output.getvalue()
+
+    def analyze(self, question: str):
+        observer = ComputerObserver()
+        screen_state = observer.get_screen_state()
+        image_bytes = self.capture_screen()
+
+        encoded_image = base64.b64encode(
+            image_bytes
+        ).decode("utf-8")
+
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are JARVIS's visual observation system. "
+                        "Your job is to report only information that can be "
+                        "directly verified from the supplied screenshot. "
+                        "Never guess, infer hidden information, or invent "
+                        "filenames, paths, applications, UI elements, or text. "
+                        "If the requested information cannot be read clearly "
+                        "from the screenshot, return UNKNOWN. "
+                        "Answer only the user's specific question. "
+                        "Be concise and factual."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                f"{question}\n\n"
+                                "Here is deterministic information obtained directly "
+                                "from the Windows computer observer:\n"
+                                f"{screen_state}\n\n"
+                                "Use this computer-state information when it directly "
+                                "answers the question. Use the screenshot only for "
+                                "information that cannot be obtained from the computer "
+                                "observer.\n\n"
+                                "Only report information supported by either the "
+                                "computer-state data or the screenshot. "
+                                "Never guess or invent filenames, paths, applications, "
+                                "UI elements, or text. "
+                                "If the requested information cannot be verified clearly, "
+                                "return UNKNOWN. "
+                                "Be concise and factual."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (
+                                    "data:image/jpeg;base64,"
+                                    f"{encoded_image}"
+                                ),
+                            },
+                        },
+                    ],
+                },
+            ],
+            max_completion_tokens=256,
+            reasoning_effort="none",
+        )
+
+        return response.choices[0].message.content.strip()
+
+    def locate(self, question: str):
+        """
+        Locate something visible and return its screen coordinates.
+
+        Deterministic ground-truth is provided so the model answers in
+        a verifiable coordinate frame instead of hallucinating.
+        """
+
+        observer = ComputerObserver()
+        screen_state = observer.get_screen_state()
+
+        image = ImageGrab.grab()
+        width, height = image.size
+
+        output = BytesIO()
+        image.convert("RGB").save(output, format="JPEG", quality=85)
+
+        encoded_image = base64.b64encode(output.getvalue()).decode("utf-8")
+
+        # ------------------------------------------------
+        # PASS 1: coarse grid cell
+        # ------------------------------------------------
+        grid_prompt = f"""{question}
+
+This image is a screenshot of the user's screen ({width}x{height} pixels).
+The screen is divided into a grid: 3 rows and 4 columns.
+Row 1 is the top, column 1 is the left.
+
+In which grid cell is the described item? If it spans cells, pick the
+cell containing its center. If it is not visible, return exactly
+UNKNOWN. Otherwise return ONLY:
+
+{{"row": <1-3>, "col": <1-4>}}
+"""
+
+        cell = self._vision_json(
+            self.locate_model,
+            grid_prompt,
+            encoded_image,
+        )
+
+        if (
+            not isinstance(cell, dict)
+            or "row" not in cell
+            or "col" not in cell
+        ):
+            return {
+                "success": False,
+                "error": "I couldn't find that on the screen.",
+            }
+
+        try:
+            row = int(cell["row"])
+            col = int(cell["col"])
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "I couldn't find that on the screen.",
+            }
+
+        if not (1 <= row <= 3 and 1 <= col <= 4):
+            return {
+                "success": False,
+                "error": "I couldn't find that on the screen.",
+            }
+
+        # ------------------------------------------------
+        # PASS 2: zoom into the cell and refine
+        # ------------------------------------------------
+        cell_w = width // 4
+        cell_h = height // 3
+
+        margin = 40
+
+        left = max(0, (col - 1) * cell_w - margin)
+        top = max(0, (row - 1) * cell_h - margin)
+        right = min(width, col * cell_w + margin)
+        bottom = min(height, row * cell_h + margin)
+
+        crop = image.crop((left, top, right, bottom))
+
+        scale = 2
+
+        crop = crop.resize(
+            (crop.width * scale, crop.height * scale)
+        )
+
+        crop_output = BytesIO()
+        crop.convert("RGB").save(crop_output, format="JPEG", quality=90)
+
+        crop_encoded = base64.b64encode(
+            crop_output.getvalue()
+        ).decode("utf-8")
+
+        crop_prompt = f"""{question}
+
+This image is a zoomed-in crop from the user's screen. It is exactly
+{crop.width}x{crop.height} pixels, counted from the TOP-LEFT corner.
+
+Report the pixel coordinates of the CENTER of the described item within
+THIS image. If it is not visible in this crop, return exactly UNKNOWN.
+Otherwise return ONLY:
+
+{{"x": <center_x>, "y": <center_y>}}
+"""
+
+        point = self._vision_json(
+            self.locate_model,
+            crop_prompt,
+            crop_encoded,
+        )
+
+        if (
+            not isinstance(point, dict)
+            or not isinstance(point.get("x"), int)
+            or not isinstance(point.get("y"), int)
+        ):
+            return {
+                "success": False,
+                "error": "I couldn't locate that on the screen.",
+            }
+
+        x = left + int(point["x"]) // scale
+        y = top + int(point["y"]) // scale
+
+        x = max(0, min(width - 1, x))
+        y = max(0, min(height - 1, y))
+
+        return {
+            "success": True,
+            "x": x,
+            "y": y,
+            "width": width,
+            "height": height,
+        }
+
+    def _vision_json(self, model: str, prompt: str, encoded_image: str):
+        """Send one vision request and parse a JSON object reply."""
+
+        import json
+        import re
+
+        response = self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": (
+                                    "data:image/jpeg;base64,"
+                                    f"{encoded_image}"
+                                )
+                            },
+                        },
+                    ],
+                },
+            ],
+            max_completion_tokens=64,
+            temperature=0.0,
+        )
+
+        text = response.choices[0].message.content.strip()
+
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{[^\}]*\}", text, re.DOTALL)
+
+            if match:
+                try:
+                    return json.loads(match.group(0))
+                except json.JSONDecodeError:
+                    return None
+
+            return None
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\skill_store.py =====
+
+"""
+Skill system for JARVIS.
+
+A skill is a named, reusable sequence of tool steps saved by the user
+("my study setup", "morning routine"). Skills are stored as JSON in
+data/skills.json and executed through the standard tool runtime.
+
+Security: steps whose tools require user confirmation are NEVER
+auto-executed by skill execution; they are reported as skipped.
+"""
+
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+
+class SkillStore:
+    """JSON-file-backed store of reusable JARVIS workflows."""
+
+    def __init__(self, path=None, tool_validator=None):
+        self.path = Path(
+            path
+            or os.path.join("data", "skills.json")
+        )
+
+        self._lock = threading.Lock()
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Callable(name) -> tool definition or None.
+        self.tool_validator = tool_validator
+
+        self._skills = []
+
+        self._load()
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def create(
+        self,
+        name: str,
+        description: str,
+        steps: list,
+        triggers=None,
+    ) -> dict:
+        """Create or replace (version-bump) a skill after validation."""
+
+        skill_name = (name or "").strip().lower()
+
+        if not isinstance(name, str) or not name.strip():
+            return {
+                "success": False,
+                "error": "The skill needs a name.",
+            }
+
+        if not isinstance(steps, list) or not steps:
+            return {
+                "success": False,
+                "error": "The skill needs at least one step.",
+            }
+
+        normalized_steps = []
+
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict):
+                return {
+                    "success": False,
+                    "error": f"Step {index} is not a valid step object.",
+                }
+
+            tool = step.get("tool")
+
+            if not isinstance(tool, str) or not tool.strip():
+                return {
+                    "success": False,
+                    "error": f"Step {index} is missing a tool name.",
+                }
+
+            validation = self._validate_tool(tool)
+
+            if not validation["ok"]:
+                return {
+                    "success": False,
+                    "error": f"Step {index}: {validation['error']}",
+                }
+
+            parameters = step.get("parameters", {})
+
+            if not isinstance(parameters, dict):
+                return {
+                    "success": False,
+                    "error": f"Step {index}: parameters must be an object.",
+                }
+
+            normalized_steps.append(
+                {
+                    "tool": tool.strip(),
+                    "parameters": parameters,
+                }
+            )
+
+        skill = {
+            "name": skill_name,
+            "display_name": name.strip(),
+            "description": (description or "").strip(),
+            "triggers": self._normalize_triggers(triggers),
+            "steps": normalized_steps,
+            "version": self._version_of(skill_name) + 1,
+            "created_at": self._created_of(skill_name) or time.time(),
+            "updated_at": time.time(),
+        }
+
+        with self._lock:
+            existing = self._find(skill["name"])
+
+            if existing is not None:
+                existing.update(skill)
+                message = f"Updated skill: {skill['display_name']}"
+            else:
+                self._skills.append(skill)
+                message = f"Created skill: {skill['display_name']}"
+
+            if skill["version"] > 1:
+                message += f" (v{skill['version']})"
+
+            self._save()
+
+        return {
+            "success": True,
+            "skill": skill,
+            "message": message,
+        }
+
+    def find_by_trigger(self, request: str):
+        """
+        Return the skill whose trigger phrase best matches the
+        request, or None.
+
+        Matching is INTENT-based, not word-for-word: stopwords and
+        command scaffolding are ignored, so "get my study session
+        ready", "start my study session", and "my study session
+        please" all fire a skill saved as "my study session". Exact
+        containment still wins, with a fuzzy word-overlap fallback
+        that requires the CORE words of the trigger to all appear.
+        """
+
+        request = " ".join((request or "").lower().split())
+
+        if not request:
+            return None
+
+        with self._lock:
+            best = None
+            best_len = 0
+
+            for skill in self._skills:
+                for trigger in skill.get("triggers", []):
+                    trigger = " ".join(trigger.split())
+
+                    if not trigger:
+                        continue
+
+                    if (
+                        request == trigger
+                        or request.startswith(trigger + " ")
+                        or request.endswith(" " + trigger)
+                        or trigger in request
+                    ):
+                        if len(trigger) > best_len:
+                            best = skill
+                            best_len = len(trigger)
+
+        if best is not None:
+            return best
+
+        # ---------------------------------------------
+        # FUZZY FALLBACK: strip command scaffolding from both sides
+        # and require the trigger's core words to all appear in the
+        # request. "get my study session ready" keeps "study session"
+        # -> matches the "my study session" trigger.
+        # ---------------------------------------------
+
+        request_core = self._core_words(request)
+
+        if not request_core:
+            return None
+
+        with self._lock:
+            best = None
+            best_score = 0
+
+            for skill in self._skills:
+                for trigger in skill.get("triggers", []):
+                    trigger_core = self._core_words(trigger)
+
+                    if not trigger_core:
+                        continue
+
+                    # Every core trigger word must appear in the
+                    # request (order-independent)...
+                    if not trigger_core <= request_core:
+                        continue
+
+                    # ...and the request must not carry a completely
+                    # different core intent ("open chrome" must not
+                    # fire "study session").
+                    extra = request_core - trigger_core
+
+                    allowed_extra = {
+                        "get", "start", "run", "do", "execute",
+                        "activate", "begin", "ready", "launch",
+                        "please", "now", "skill", "routine",
+                        "mode", "setup", "time", "my", "session",
+                    }
+
+                    if not extra <= allowed_extra:
+                        continue
+
+                    score = len(trigger_core)
+
+                    if score > best_score:
+                        best = skill
+                        best_score = score
+
+        return best
+
+    @staticmethod
+    def _core_words(text: str) -> set:
+        """
+        Meaning-bearing words of a phrase: stopwords, command verbs,
+        and politeness scaffolding removed. "get my study session
+        ready" -> {"study", "session"}.
+        """
+
+        stopwords = {
+            "a", "an", "the", "my", "me", "mine", "i", "you",
+            "your", "it", "that", "this", "for", "to", "of",
+            "in", "on", "at", "with", "and", "or", "please",
+            "hey", "jarvis", "could", "would", "can", "will",
+            "get", "got", "give", "let", "make", "put", "set",
+            "start", "begin", "run", "do", "execute", "activate",
+            "ready", "up", "go", "now", "then", "just", "some",
+            "time", "thing", "stuff", "mode", "skill", "routine",
+            "command", "again", "back",
+        }
+
+        return {
+            word
+            for word in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if word not in stopwords and len(word) > 1
+        }
+
+    @staticmethod
+    def _normalize_triggers(triggers) -> list:
+        if isinstance(triggers, str):
+            triggers = [triggers]
+
+        if not isinstance(triggers, list):
+            return []
+
+        normalized = []
+
+        for trigger in triggers:
+            if isinstance(trigger, str) and trigger.strip():
+                normalized.append(trigger.strip().lower())
+
+        return normalized
+
+    def _version_of(self, name: str) -> int:
+        skill = self._find(name)
+
+        return (
+            skill.get("version", 1)
+            if skill
+            else 0
+        )
+
+    def _created_of(self, name: str):
+        skill = self._find(name)
+
+        return (
+            skill.get("created_at")
+            if skill
+            else None
+        )
+
+    def discover(self, query: str = "") -> dict:
+        """List skills, optionally filtered by keywords."""
+
+        query = (query or "").strip().lower()
+
+        with self._lock:
+            if not query:
+                matches = list(self._skills)
+            else:
+                keywords = re.findall(r"[a-z0-9]+", query)
+
+                matches = [
+                    skill
+                    for skill in self._skills
+                    if self._matches(skill, keywords)
+                ]
+
+        if not matches:
+            return {
+                "success": True,
+                "skills": [],
+                "message": "No matching skills saved yet.",
+            }
+
+        names = [
+            skill["display_name"]
+            + (f" ({skill['description']})" if skill["description"] else "")
+            for skill in matches
+        ]
+
+        return {
+            "success": True,
+            "skills": matches,
+            "message": "Saved skills: " + "; ".join(names),
+        }
+
+    def validate(self, skill: dict) -> dict:
+        """Validate a skill object without saving it."""
+
+        if not isinstance(skill, dict):
+            return {
+                "success": False,
+                "error": "A skill must be an object.",
+            }
+
+        steps = skill.get("steps")
+
+        if not isinstance(steps, list) or not steps:
+            return {
+                "success": False,
+                "error": "A skill needs at least one step.",
+            }
+
+        for index, step in enumerate(steps):
+            if not isinstance(step, dict) or not step.get("tool"):
+                return {
+                    "success": False,
+                    "error": f"Step {index} is invalid.",
+                }
+
+            validation = self._validate_tool(step["tool"])
+
+            if not validation["ok"]:
+                return {
+                    "success": False,
+                    "error": f"Step {index}: {validation['error']}",
+                }
+
+        return {
+            "success": True,
+            "message": "The skill is valid.",
+        }
+
+    def get(self, name: str):
+        with self._lock:
+            return self._find((name or "").strip().lower())
+
+    def delete(self, name: str) -> dict:
+        with self._lock:
+            skill = self._find((name or "").strip().lower())
+
+            if skill is None:
+                return {
+                    "success": False,
+                    "error": f"No skill named {name} was found.",
+                }
+
+            self._skills.remove(skill)
+            self._save()
+
+        return {
+            "success": True,
+            "message": f"Deleted skill: {skill['display_name']}",
+        }
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    def _validate_tool(self, tool: str) -> dict:
+        if self.tool_validator is None:
+            return {"ok": True}
+
+        definition = self.tool_validator(tool)
+
+        if definition is None:
+            return {
+                "ok": False,
+                "error": f"Unknown tool '{tool}'.",
+            }
+
+        return {"ok": True}
+
+    def _requires_confirmation(self, tool: str) -> bool:
+        if self.tool_validator is None:
+            return False
+
+        definition = self.tool_validator(tool)
+
+        return bool(
+            definition
+            and getattr(definition, "confirmation_required", False)
+        )
+
+    @staticmethod
+    def _matches(skill: dict, keywords: list) -> bool:
+        text = " ".join(
+            [
+                skill.get("name", ""),
+                skill.get("display_name", ""),
+                skill.get("description", ""),
+            ]
+        ).lower()
+
+        return any(keyword in text for keyword in keywords)
+
+    def _find(self, name: str):
+        for skill in self._skills:
+            if skill["name"] == name:
+                return skill
+
+        return None
+
+    def _load(self):
+        if not self.path.exists():
+            return
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if isinstance(data, list):
+                self._skills = data
+
+        except (json.JSONDecodeError, OSError):
+            self._skills = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as file:
+                json.dump(self._skills, file, indent=2)
+
+        except OSError:
+            pass
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\system.py =====
+
+import subprocess
+import time
+import socket
+
+import psutil
+import screen_brightness_control as sbc
+
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+from comtypes import CLSCTX_ALL
+
+
+class SystemController:
+    def __init__(self):
+        self.volume = self._get_volume_controller()
+
+    def _get_volume_controller(self):
+        device = AudioUtilities.GetSpeakers()
+
+        return device.EndpointVolume
+
+    # -------------------------
+    # VOLUME
+    # -------------------------
+
+    def get_volume(self):
+        return round(self.volume.GetMasterVolumeLevelScalar() * 100)
+
+    def set_volume(self, percentage):
+        percentage = max(0, min(100, int(percentage)))
+
+        self.volume.SetMasterVolumeLevelScalar(
+            percentage / 100,
+            None,
+        )
+
+        return f"Volume set to {percentage}%."
+
+    def increase_volume(self, amount=10):
+        new_volume = min(100, self.get_volume() + amount)
+
+        self.volume.SetMasterVolumeLevelScalar(
+            new_volume / 100,
+            None,
+        )
+
+        return f"Volume increased to {new_volume}%."
+
+    def decrease_volume(self, amount=10):
+        new_volume = max(0, self.get_volume() - amount)
+
+        self.volume.SetMasterVolumeLevelScalar(
+            new_volume / 100,
+            None,
+        )
+
+        return f"Volume decreased to {new_volume}%."
+
+    def mute(self):
+        self.volume.SetMute(1, None)
+        return "Volume muted."
+
+    def unmute(self):
+        self.volume.SetMute(0, None)
+        return "Volume unmuted."
+
+    # -------------------------
+    # PER-APPLICATION VOLUME
+    # (Windows Volume Mixer: lets "increase the volume of the YouTube
+    # video" target one app's session instead of the master volume.)
+    # -------------------------
+
+    @staticmethod
+    def _find_app_session(app_name: str):
+        """Find a Windows audio session whose process matches app_name."""
+
+        from pycaw.pycaw import AudioUtilities
+
+        requested = app_name.lower().strip().removesuffix(".exe")
+
+        if not requested:
+            return None, None
+
+        sessions = AudioUtilities.GetAllSessions()
+
+        for session in sessions:
+            process = getattr(session, "Process", None)
+
+            if process is None:
+                continue
+
+            process_name = (
+                process.name() or ""
+            ).lower().removesuffix(".exe")
+
+            if requested in process_name or process_name in requested:
+                return session, process_name
+
+        return None, None
+
+    def get_app_volume(self, app_name: str):
+        session, process_name = self._find_app_volume_session(app_name)
+
+        if session is None:
+            return {
+                "success": False,
+                "error": (
+                    f"No audio is playing from {app_name} right now, "
+                    "so I can't adjust its volume."
+                ),
+            }
+
+        volume = round(session.SimpleAudioVolume.GetMasterVolume() * 100)
+
+        return {
+            "success": True,
+            "application": process_name,
+            "volume_percent": volume,
+            "message": (
+                f"{process_name} volume is at {volume} percent."
+            ),
+        }
+
+    # Alias kept for clarity at call sites.
+    _find_app_volume_session = _find_app_session
+
+    def set_app_volume(self, app_name: str, percentage: int):
+        percentage = max(0, min(100, int(percentage)))
+
+        session, process_name = self._find_app_volume_session(app_name)
+
+        if session is None:
+            return {
+                "success": False,
+                "error": (
+                    f"No audio is playing from {app_name} right now, "
+                    "so I can't adjust its volume."
+                ),
+            }
+
+        session.SimpleAudioVolume.SetMasterVolume(
+            percentage / 100,
+            None,
+        )
+
+        return (
+            f"{process_name} volume set to {percentage} percent. "
+            "Your overall system volume is unchanged."
+        )
+
+    def adjust_app_volume(self, app_name: str, delta: int):
+        current = self.get_app_volume(app_name)
+
+        if not current.get("success"):
+            return current
+
+        new_value = max(
+            0,
+            min(
+                100,
+                int(current.get("volume_percent", 0)) + delta,
+            ),
+        )
+
+        return self.set_app_volume(app_name, new_value)
+
+    # -------------------------
+    # BRIGHTNESS
+    # -------------------------
+
+    def get_brightness(self):
+        values = sbc.get_brightness()
+
+        if isinstance(values, list):
+            return round(values[0])
+
+        return round(values)
+
+    def set_brightness(self, percentage):
+        percentage = max(0, min(100, int(percentage)))
+
+        sbc.set_brightness(percentage)
+
+        return f"Brightness set to {percentage}%."
+
+    def increase_brightness(self, amount=10):
+        new_brightness = min(100, self.get_brightness() + amount)
+
+        sbc.set_brightness(new_brightness)
+
+        return f"Brightness increased to {new_brightness}%."
+
+    def decrease_brightness(self, amount=10):
+        new_brightness = max(0, self.get_brightness() - amount)
+
+        sbc.set_brightness(new_brightness)
+
+        return f"Brightness decreased to {new_brightness}%."
+
+    # -------------------------
+    # BATTERY
+    # -------------------------
+
+    def battery_status(self):
+        battery = psutil.sensors_battery()
+
+        if battery is None:
+            return "Battery information is unavailable."
+
+        percentage = round(battery.percent)
+
+        if battery.power_plugged:
+            return f"Battery is at {percentage}% and the laptop is charging."
+
+        return f"Battery is at {percentage}%."
+
+    # -------------------------
+    # LOCK
+    # -------------------------
+
+    def lock(self):
+        subprocess.run(
+            ["rundll32.exe", "user32.dll,LockWorkStation"],
+            check=False,
+        )
+
+        return "Locking the laptop."
+
+    # -------------------------
+    # SLEEP
+    # -------------------------
+
+    def sleep(self):
+        subprocess.run(
+            [
+                "powershell",
+                "-Command",
+                "Start-Sleep -Seconds 1; Add-Type -AssemblyName System.Windows.Forms; "
+                "[System.Windows.Forms.Application]::SetSuspendState('Suspend', $false, $false)"
+            ],
+            check=False,
+        )
+
+        return "Putting the laptop to sleep."
+
+    # -------------------------
+    # RESTART
+    # -------------------------
+
+    def restart(self):
+        subprocess.run(
+            ["shutdown", "/r", "/t", "5"],
+            check=False,
+        )
+
+        return "The laptop will restart in 5 seconds."
+
+    # -------------------------
+    # SHUTDOWN
+    # -------------------------
+
+    def shutdown(self):
+        subprocess.run(
+            ["shutdown", "/s", "/t", "5"],
+            check=False,
+        )
+
+        return "The laptop will shut down in 5 seconds."
+
+    # -------------------------
+    # SYSTEM INFO
+    # -------------------------
+
+    def uptime(self):
+        seconds = time.time() - psutil.boot_time()
+
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+
+        return f"The laptop has been running for {hours} hours and {minutes} minutes."
+
+    def wifi_status(self):
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        output = result.stdout
+
+        if "State" in output and "connected" in output.lower():
+            for line in output.splitlines():
+                if "SSID" in line and "BSSID" not in line:
+                    ssid = line.split(":", 1)[1].strip()
+                    return f"Wi-Fi is connected to {ssid}."
+
+            return "Wi-Fi is connected."
+
+        return "Wi-Fi is disconnected."
+
+    def bluetooth_status(self):
+        result = subprocess.run(
+            [
+                "powershell",
+                "-Command",
+                "Get-PnpDevice -Class Bluetooth | "
+                "Where-Object {$_.Status -eq 'OK'} | "
+                "Select-Object -First 1"
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+        if result.stdout.strip():
+            return "Bluetooth is available and enabled."
+
+        return "Bluetooth is unavailable or disabled."
+
+    def network_info(self):
+        hostname = socket.gethostname()
+
+        try:
+            ip_address = socket.gethostbyname(hostname)
+        except socket.gaierror:
+            ip_address = "unavailable"
+
+        return f"Hostname is {hostname}. Local IP address is {ip_address}."
+
+if __name__ == "__main__":
+    controller = SystemController()
+
+    print("SYSTEM CONTROLLER READY")
+
+    print("Volume:", controller.get_volume(), "%")
+    print("Brightness:", controller.get_brightness(), "%")
+    print(controller.battery_status())
+    print(controller.uptime())
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\system_observer.py =====
+
+import socket
+import subprocess
+import time
+
+import psutil
+
+
+class SystemObserver:
+    """Collect read-only information about the Windows computer."""
+
+    def get_cpu(self):
+        return {
+            "success": True,
+            "usage_percent": psutil.cpu_percent(interval=0.5),
+            "cores": psutil.cpu_count(logical=False),
+            "logical_processors": psutil.cpu_count(logical=True),
+        }
+
+    def get_memory(self):
+        memory = psutil.virtual_memory()
+
+        return {
+            "success": True,
+            "usage_percent": memory.percent,
+            "total": self._format_bytes(memory.total),
+            "used": self._format_bytes(memory.used),
+            "available": self._format_bytes(memory.available),
+        }
+
+    def get_storage(self):
+        partitions = []
+
+        for partition in psutil.disk_partitions():
+            try:
+                usage = psutil.disk_usage(partition.mountpoint)
+
+                partitions.append({
+                    "drive": partition.mountpoint,
+                    "total": self._format_bytes(usage.total),
+                    "used": self._format_bytes(usage.used),
+                    "free": self._format_bytes(usage.free),
+                    "usage_percent": usage.percent,
+                })
+            except (PermissionError, OSError):
+                continue
+
+        return {
+            "success": True,
+            "partitions": partitions,
+        }
+
+    def get_battery(self):
+        battery = psutil.sensors_battery()
+
+        if battery is None:
+            return {
+                "success": True,
+                "available": False,
+                "message": "Battery information is not available.",
+            }
+
+        return {
+            "success": True,
+            "available": True,
+            "percent": battery.percent,
+            "plugged_in": battery.power_plugged,
+            "seconds_remaining": (
+                battery.secsleft
+                if battery.secsleft != psutil.POWER_TIME_UNLIMITED
+                else None
+            ),
+        }
+
+    def get_network(self):
+        try:
+            hostname = socket.gethostname()
+            local_ip = socket.gethostbyname(hostname)
+        except OSError:
+            hostname = socket.gethostname()
+            local_ip = None
+
+        connections = psutil.net_connections(kind="inet")
+
+        established = sum(
+            1
+            for connection in connections
+            if connection.status == psutil.CONN_ESTABLISHED
+        )
+
+        return {
+            "success": True,
+            "hostname": hostname,
+            "local_ip": local_ip,
+            "active_connections": established,
+        }
+
+    def get_wifi(self):
+        try:
+            result = subprocess.run(
+                [
+                    "netsh",
+                    "wlan",
+                    "show",
+                    "interfaces",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=5,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": "Could not read Wi-Fi information.",
+                }
+
+            details = self._parse_netsh_wifi(result.stdout)
+
+            return {
+                "success": True,
+                "connected": details.get("state", "").lower() == "connected",
+                "details": self._parse_netsh_wifi(result.stdout),
+            }
+
+        except (OSError, subprocess.SubprocessError) as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_wifi_speed(self):
+        try:
+            result = subprocess.run(
+                [
+                    "netsh",
+                    "wlan",
+                    "show",
+                    "interfaces",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=5,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": "Could not read Wi-Fi speed.",
+                }
+
+            details = self._parse_netsh_wifi(result.stdout)
+
+            return {
+                "success": True,
+                "receive_speed": details.get("receive_rate"),
+                "transmit_speed": details.get("transmit_rate"),
+            }
+
+        except (OSError, subprocess.SubprocessError) as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_bluetooth(self):
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-PnpDevice -Class Bluetooth | "
+                    "Select-Object Status, FriendlyName | "
+                    "ConvertTo-Json",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": "Could not read Bluetooth information.",
+                }
+
+            output = result.stdout.strip()
+
+            if not output:
+                return {
+                    "success": True,
+                    "available": False,
+                    "devices": [],
+                }
+
+            return {
+                "success": True,
+                "available": True,
+                "raw": output,
+            }
+
+        except (OSError, subprocess.SubprocessError) as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_gpu(self):
+        try:
+            result = subprocess.run(
+                [
+                    "powershell",
+                    "-NoProfile",
+                    "-Command",
+                    "Get-Counter "
+                    "'\\GPU Engine(*)\\Utilization Percentage' "
+                    "-ErrorAction SilentlyContinue | "
+                    "Select-Object -ExpandProperty CounterSamples | "
+                    "Select-Object InstanceName,CookedValue | "
+                    "ConvertTo-Json",
+                ],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=10,
+            )
+
+            if result.returncode != 0:
+                return {
+                    "success": False,
+                    "error": "Could not read GPU information.",
+                }
+
+            output = result.stdout.strip()
+
+            if not output:
+                return {
+                    "success": True,
+                    "usage_percent": 0.0,
+                }
+
+            import json
+
+            data = json.loads(output)
+
+            if isinstance(data, dict):
+                data = [data]
+
+            values = []
+
+            for item in data:
+                try:
+                    value = float(item.get("CookedValue", 0))
+                    values.append(value)
+                except (TypeError, ValueError):
+                    continue
+
+            usage = max(values) if values else 0.0
+
+            return {
+                "success": True,
+                "usage_percent": round(usage, 2),
+            }
+
+        except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as error:
+            return {
+                "success": False,
+                "error": str(error),
+            }
+
+    def get_laptop_state(self):
+        return {
+            "success": True,
+            "cpu": self.get_cpu(),
+            "memory": self.get_memory(),
+            "battery": self.get_battery(),
+            "network": self.get_network(),
+        }
+
+    def _parse_netsh_wifi(self, output):
+        details = {}
+
+        for line in output.splitlines():
+            if ":" not in line:
+                continue
+
+            key, value = line.split(":", 1)
+
+            key = key.strip().lower()
+            value = value.strip()
+
+            if key == "state":
+                details["state"] = value
+
+            elif key == "ssid":
+                details["ssid"] = value
+
+            elif key == "band":
+                details["band"] = value
+
+            elif key == "channel":
+                details["channel"] = value
+
+            elif key == "radio type":
+                details["radio_type"] = value
+
+            elif key == "receive rate (mbps)":
+                details["receive_rate"] = value
+
+            elif key == "transmit rate (mbps)":
+                details["transmit_rate"] = value
+
+            elif key == "signal":
+                details["signal"] = value
+
+            elif key == "rssi":
+                details["rssi"] = value
+
+            elif key == "profile":
+                details["profile"] = value
+
+        return details
+
+    def _format_bytes(self, value):
+        units = ["B", "KB", "MB", "GB", "TB"]
+
+        size = float(value)
+
+        for unit in units:
+            if size < 1024 or unit == units[-1]:
+                return f"{size:.2f} {unit}"
+
+            size /= 1024
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\web_search.py =====
+
+"""
+Web search and page-fetch helper for the web.* tools.
+
+Uses DuckDuckGo's HTML endpoint (no API key required) for search and
+returns readable text for fetch. Results are dicts with success/error
+so the tool runtime can speak them naturally.
+"""
+
+import re
+import urllib.parse
+import urllib.request
+
+_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0 Safari/537.36"
+)
+
+_TIMEOUT = 10
+
+
+class WebSearcher:
+    """Deterministic web search/fetch without browser UI."""
+
+    def search(self, query: str) -> dict:
+        query = (query or "").strip()
+
+        if not query:
+            return {
+                "success": False,
+                "error": "No search query was provided.",
+            }
+
+        url = (
+            "https://html.duckduckgo.com/html/?q="
+            + urllib.parse.quote(query)
+        )
+
+        try:
+            html = self._get(url)
+        except Exception as error:
+            return {
+                "success": False,
+                "error": f"Web search failed: {error}",
+            }
+
+        results = self._parse_results(html)
+
+        if not results:
+            return {
+                "success": True,
+                "results": [],
+                "message": "No results found.",
+            }
+
+        return {
+            "success": True,
+            "results": results,
+            "message": (
+                f"Found {len(results)} results. "
+                f"Top result: {results[0]['title']} - "
+                f"{results[0]['snippet']}"
+            ),
+        }
+
+    def fetch(self, url: str) -> dict:
+        url = (url or "").strip()
+
+        if not url:
+            return {
+                "success": False,
+                "error": "No URL was provided.",
+            }
+
+        if not url.startswith(("http://", "https://")):
+            url = "https://" + url
+
+        try:
+            html = self._get(url)
+        except Exception as error:
+            return {
+                "success": False,
+                "error": f"Could not fetch the page: {error}",
+            }
+
+        text = self._html_to_text(html)
+
+        if not text:
+            return {
+                "success": True,
+                "text": "",
+                "message": "The page loaded but contains no readable text.",
+            }
+
+        return {
+            "success": True,
+            "text": text[:5000],
+            "message": text[:1000],
+        }
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    def _get(self, url: str) -> str:
+        request = urllib.request.Request(
+            url,
+            headers={"User-Agent": _USER_AGENT},
+        )
+
+        with urllib.request.urlopen(request, timeout=_TIMEOUT) as response:
+            return response.read().decode("utf-8", errors="ignore")
+
+    @staticmethod
+    def _parse_results(html: str) -> list:
+        results = []
+
+        blocks = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html,
+            re.DOTALL,
+        )
+
+        snippets = re.findall(
+            r'class="result__snippet"[^>]*>(.*?)</a>',
+            html,
+            re.DOTALL,
+        )
+
+        for index, (href, title) in enumerate(blocks[:5]):
+            # DuckDuckGo wraps URLs in a redirect; unwrap if present.
+            match = re.search(r"uddg=([^&]+)", href)
+
+            if match:
+                href = urllib.parse.unquote(match.group(1))
+
+            snippet = (
+                WebSearcher._strip_tags(snippets[index])
+                if index < len(snippets)
+                else ""
+            )
+
+            results.append(
+                {
+                    "title": WebSearcher._strip_tags(title),
+                    "url": href,
+                    "snippet": snippet,
+                }
+            )
+
+        return results
+
+    @staticmethod
+    def _html_to_text(html: str) -> str:
+        html = re.sub(
+            r"<(script|style)[^>]*>.*?</\1>",
+            " ",
+            html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+
+        return text.strip()
+
+    @staticmethod
+    def _strip_tags(value: str) -> str:
+        value = re.sub(r"<[^>]+>", "", value)
+        return re.sub(r"\s+", " ", value).strip()
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\whatsapp.py =====
+
+"""
+WhatsApp Desktop automation.
+
+Activates the WhatsApp window, finds a chat via its search box, and
+sends a typed message. Used through the gated
+"application.whatsapp_message" tool â€” always confirmed by the user
+first, and only when WhatsApp is already running and signed in.
+"""
+
+import ctypes
+import os
+import re
+import time
+from ctypes import wintypes
+
+import win32clipboard
+import win32con
+import win32gui
+
+user32 = ctypes.windll.user32
+
+# ------------------------------------------------------------
+# Low-level input (SendInput with UNICODE for arbitrary names)
+# ------------------------------------------------------------
+
+INPUT_KEYBOARD = 1
+KEYEVENTF_KEYUP = 0x0002
+KEYEVENTF_UNICODE = 0x0004
+
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", wintypes.WORD),
+        ("wScan", wintypes.WORD),
+        ("dwFlags", wintypes.DWORD),
+        ("time", wintypes.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG)),
+    ]
+
+
+class _INPUTUNION(ctypes.Union):
+    _fields_ = [("ki", KEYBDINPUT)]
+
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", wintypes.DWORD),
+        ("union", _INPUTUNION),
+    ]
+
+
+def _send_key_event(vk_or_scan, flags):
+    event = INPUT()
+    event.type = INPUT_KEYBOARD
+    event.union.ki.wVk = 0 if flags & KEYEVENTF_UNICODE else vk_or_scan
+    event.union.ki.wScan = vk_or_scan if flags & KEYEVENTF_UNICODE else 0
+    event.union.ki.dwFlags = flags
+    event.union.ki.time = 0
+    event.union.ki.dwExtraInfo = ctypes.pointer(wintypes.ULONG(0))
+
+    user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+
+
+def press_key(vk_code):
+    _send_key_event(vk_code, 0)
+    _send_key_event(vk_code, KEYEVENTF_KEYUP)
+
+
+def press_combo(*vk_codes):
+    for vk in vk_codes:
+        _send_key_event(vk, 0)
+
+    for vk in reversed(vk_codes):
+        _send_key_event(vk, KEYEVENTF_KEYUP)
+
+
+def type_unicode(text):
+    for char in text:
+        code = ord(char)
+
+        if code == 0:
+            continue
+
+        # Surrogate pairs for characters outside the BMP.
+        if code > 0xFFFF:
+            code -= 0x10000
+            for part in (0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF)):
+                _send_key_event(part, KEYEVENTF_UNICODE)
+                _send_key_event(part, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+        else:
+            _send_key_event(code, KEYEVENTF_UNICODE)
+            _send_key_event(code, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+
+
+VK_CONTROL = 0x11
+VK_MENU = 0x12
+VK_RETURN = 0x0D
+VK_ESCAPE = 0x1B
+VK_V = 0x56
+VK_F = 0x46
+
+
+def _set_clipboard_text(text: str) -> bool:
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text, win32con.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+        return True
+
+    except Exception:
+        return False
+
+
+def _paste_text(text: str) -> bool:
+    if not _set_clipboard_text(text):
+        return False
+
+    press_combo(VK_CONTROL, VK_V)
+
+    return True
+
+
+# ------------------------------------------------------------
+# Window discovery
+# ------------------------------------------------------------
+
+def find_whatsapp_window():
+    """
+    Return the best WhatsApp window handle: a visible one first,
+    then the largest hidden one (WhatsApp keeps several helper
+    windows with the same title; the real one is the big one).
+    """
+
+    visible = []
+    hidden = []
+
+    def collect(hwnd, _):
+        title = win32gui.GetWindowText(hwnd)
+
+        if "WhatsApp" in title:
+            try:
+                left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+                area = max(0, right - left) * max(0, bottom - top)
+
+            except Exception:
+                area = 0
+
+            if win32gui.IsWindowVisible(hwnd):
+                visible.append((area, hwnd))
+
+            else:
+                hidden.append((area, hwnd))
+
+        return True
+
+    win32gui.EnumWindows(collect, None)
+
+    if visible:
+        return max(visible)[1]
+
+    if hidden:
+        return max(hidden)[1]
+
+    return None
+
+
+def is_whatsapp_running() -> bool:
+    try:
+        import psutil
+
+        for process in psutil.process_iter(["name"]):
+            name = (process.info["name"] or "").lower()
+
+            if "whatsapp" in name:
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def _activate_window(hwnd) -> bool:
+    """
+    Bring WhatsApp to the front and CONFIRM it took focus.
+
+    Windows denies focus-stealing to background processes, which is
+    exactly what JARVIS is right after launching the app. A
+    synthetic ALT tap makes SetForegroundWindow permissible; three
+    attempts with verification handle slow cold starts.
+    """
+
+    for _attempt in range(3):
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            _send_key_event(VK_MENU, 0)
+            _send_key_event(VK_MENU, KEYEVENTF_KEYUP)
+
+            win32gui.SetForegroundWindow(hwnd)
+
+            time.sleep(0.5)
+
+            if user32.GetForegroundWindow() == hwnd:
+                return True
+
+        except Exception:
+            pass
+
+        time.sleep(0.7)
+
+    return False
+
+
+def _window_is_foreground(hwnd) -> bool:
+    try:
+        return user32.GetForegroundWindow() == hwnd
+
+    except Exception:
+        return False
+
+
+def _uia_window_shows_text(hwnd, tokens, budget_seconds=4.0):
+    """
+    Bounded UI-Automation scan: does any accessible element of the
+    window expose a Name containing ALL the given word tokens?
+
+    This is the reliable chat verification: the window TITLE on the
+    current WhatsApp Desktop often stays just "WhatsApp" even with a
+    chat open, but the UI tree always exposes the chat header (and
+    message headers) with the contact's display name.
+    """
+
+    tokens = [t for t in tokens if t]
+
+    if not tokens:
+        return False
+
+    try:
+        import comtypes
+        import comtypes.client
+
+        # Tool handlers run in worker threads: COM must be
+        # initialized on THIS thread before any comtypes call.
+        try:
+            comtypes.CoInitialize()
+
+        except Exception:
+            pass
+
+        uia_mod = comtypes.client.GetModule("UIAutomationCore.dll")
+
+        automation = comtypes.client.CreateObject(
+            "{ff48dba4-60ef-4201-aa87-54103eef594e}",
+            interface=uia_mod.IUIAutomation,
+        )
+
+        root = automation.ElementFromHandle(hwnd)
+
+        from collections import deque
+
+        deadline = time.time() + budget_seconds
+
+        queue = deque([root])
+
+        visited = 0
+
+        while queue and visited < 800 and time.time() < deadline:
+            element = queue.popleft()
+
+            visited += 1
+
+            try:
+                name = element.CurrentName or ""
+
+            except Exception:
+                name = ""
+
+            if name:
+                lowered = " ".join(name.lower().split())
+
+                if lowered and all(
+                    token in lowered for token in tokens
+                ):
+                    return True
+
+            try:
+                walker = automation.RawViewWalker
+
+                child = walker.GetFirstChildElement(element)
+
+                while child is not None:
+                    queue.append(child)
+
+                    child = walker.GetNextSiblingElement(child)
+
+            except Exception:
+                break
+
+    except Exception:
+        return False
+
+    return False
+
+
+_OFFLINE_MARKERS = (
+    "not connected",
+    "internet connection",
+    "reconnect",
+    "phone offline",
+    "trying to reach your phone",
+)
+
+
+def _whatsapp_offline(hwnd) -> bool:
+    """
+    Detect the 'Computer not connected' screen: WhatsApp Desktop lost
+    its link to the phone, so NO chat can open or send. Distinguishing
+    this from a wrong contact name gives the user an honest, fixable
+    message instead of a vague refusal.
+    """
+
+    ocr_lines = _ocr_window_text(hwnd)
+
+    full_text = " ".join(text for _x, _y, text in ocr_lines)
+
+    return any(marker in full_text for marker in _OFFLINE_MARKERS)
+
+
+def _chat_opened(hwnd, query):
+    """Verify the requested chat is actually open and visible."""
+
+    try:
+        chat_title = (
+            win32gui.GetWindowText(hwnd) or ""
+        ).lower()
+
+    except Exception:
+        chat_title = ""
+
+    tokens = [
+        token
+        for token in re.split(r"\s+", query.lower().strip())
+        if token
+    ]
+
+    if not tokens:
+        return False
+
+    # 1) Window title (older WhatsApp builds put the chat name here).
+    if all(token in chat_title for token in tokens):
+        return True
+
+    # 2) UI Automation scan (fast when the build exposes names).
+    if _uia_window_shows_text(hwnd, tokens, budget_seconds=3.0):
+        return True
+
+    # 3) OCR the chat-header strip. Works on every build, including
+    #    Electron builds that expose no UIA names (verified live:
+    #    the header reads e.g. "Vishwa Fatty click here for contact
+    #    info" while the window title stays just "WhatsApp"). Match
+    #    only lines in the RIGHT pane (x beyond the chat list) so a
+    #    name merely sitting in the chat list can never fake a hit.
+    #    Two attempts: the renderer can lag a beat behind the search.
+    for _attempt in range(2):
+        ocr_lines = _ocr_window_text(hwnd)
+
+        header_text = " ".join(
+            text
+            for x_frac, _y_frac, text in ocr_lines
+            if x_frac >= 0.30
+        )
+
+        if header_text and all(
+            token in header_text for token in tokens
+        ):
+            return True
+
+        time.sleep(1.2)
+
+    return False
+
+
+def _ocr_window_text(hwnd):
+    """
+    Read the visible text in the window's top strip (the chat header
+    zone) using the built-in Windows OCR engine. Returns a list of
+    (x_frac, y_frac, text) line tuples â€” coordinates as fractions of
+    the captured strip â€” or [] if anything fails. The window is
+    restored if minimized, but NOT activated: focus-stealing here
+    would break any search/send keystrokes in flight. The pixels
+    are readable from a visible (non-foreground) window.
+    """
+
+    root_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+    temp_path = os.path.join(root_dir, "data", "_wa_ocr.png")
+
+    try:
+        # Minimized or tray-hidden windows sit off-screen at
+        # -25600/-32000: restore so the pixels exist on screen, but
+        # do NOT SetForegroundWindow (that would steal focus from
+        # the WhatsApp search box mid-send).
+        if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(
+            hwnd,
+        ):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            time.sleep(0.8)
+
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+        # Still off-screen (restore lost the race): one more try,
+        # then give up rather than capture garbage.
+        if (
+            left < -20000
+            or top < -20000
+            or right - left < 400
+            or bottom - top < 300
+        ):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            time.sleep(1.2)
+
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+            if (
+                left < -20000
+                or top < -20000
+                or right - left < 400
+                or bottom - top < 300
+            ):
+                return []
+
+        from PIL import ImageGrab
+
+        # Full width, header-height strip only.
+        grab = ImageGrab.grab(
+            bbox=(
+                left,
+                top,
+                right,
+                min(top + 200, bottom),
+            )
+        )
+
+        grab.save(temp_path)
+
+    except Exception:
+        return []
+
+    try:
+        lines = _run_ocr_lines(temp_path, grab.size[0], grab.size[1])
+
+    except Exception:
+        return []
+
+    finally:
+        try:
+            os.remove(temp_path)
+
+        except OSError:
+            pass
+
+    return lines
+
+
+def _run_ocr_lines(image_path, width, height, preserve_case=False):
+    """
+    Run the PowerShell WinRT OCR helper on an image and parse its
+    "x y text" rows into (x_frac, y_frac, text) tuples. Shared by
+    the chat-header reader and the search-results reader.
+    """
+
+    import subprocess
+
+    root_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+    script = os.path.join(root_dir, "scripts", "ocr_image.ps1")
+
+    output = subprocess.run(
+        [
+            "powershell", "-NoProfile",
+            "-ExecutionPolicy", "Bypass",
+            "-File", script, image_path,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=45,
+    )
+
+    safe_width = max(1, int(width))
+    safe_height = max(1, int(height))
+
+    lines = []
+
+    for raw in (output.stdout or "").splitlines():
+        parts = raw.strip().split(None, 2)
+
+        if len(parts) != 3:
+            continue
+
+        try:
+            x_frac = int(parts[0]) / safe_width
+            y_frac = int(parts[1]) / safe_height
+
+        except ValueError:
+            continue
+
+        text = parts[2] if preserve_case else parts[2].lower()
+
+        lines.append((x_frac, y_frac, text))
+
+    return lines
+
+
+_NOISE_RESULT_TOKENS = {
+    "am", "pm", "online", "typing", "archived", "unread", "missed",
+    "chats", "contacts", "messages", "groups", "new", "chat", "group",
+    "contact", "seen", "today", "yesterday", "status", "calls",
+    "community", "communities", "settings", "updates",
+}
+
+
+def _is_noise_token(token: str) -> bool:
+    """Times, badge counts, and section labels are not name words."""
+
+    lowered = (token or "").lower().strip("â€¦.,:;!?()[]")
+
+    if not lowered:
+        return True
+
+    if re.fullmatch(r"\d+", lowered):
+        return True
+
+    if re.fullmatch(r"\d{1,2}[:.]\d{2}", lowered):
+        return True
+
+    if re.fullmatch(r"\d{1,2}\s*(?:am|pm)", lowered):
+        return True
+
+    return lowered in _NOISE_RESULT_TOKENS
+
+
+def _clean_result_name(line_text: str) -> str:
+    """
+    Turn one OCR line of a WhatsApp search row into a speakable
+    contact/chat name: keep the leading name words and drop the
+    right-aligned time, unread badge, and section noise.
+    """
+
+    kept = []
+
+    for token in line_text.split():
+        if kept and _is_noise_token(token):
+            break
+
+        kept.append(token)
+
+    while kept and _is_noise_token(kept[0]):
+        kept.pop(0)
+
+    return " ".join(kept).strip(" â€¦.!?.-")
+
+
+def _ensure_window(timeout_seconds: float = 30.0):
+    """
+    Get WhatsApp ready for automation: launch it if closed, wait for
+    its window, restore it when tray-hidden/minimized, and bring it
+    to the foreground. Returns the window handle or None.
+    """
+
+    if not is_whatsapp_running():
+        try:
+            from tools.applications import ApplicationManager
+
+            launched = ApplicationManager().open_application("whatsapp")
+
+        except Exception:
+            launched = False
+
+        if not launched:
+            return None
+
+    hwnd = None
+
+    for _ in range(int(timeout_seconds)):
+        hwnd = find_whatsapp_window()
+
+        if hwnd is not None:
+            break
+
+        time.sleep(1.0)
+
+    if hwnd is None:
+        return None
+
+    try:
+        if win32gui.IsIconic(hwnd) or not win32gui.IsWindowVisible(
+            hwnd,
+        ):
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+
+            time.sleep(0.8)
+
+    except Exception:
+        pass
+
+    time.sleep(1.5)
+
+    if not _activate_window(hwnd):
+        return None
+
+    return hwnd
+
+
+def _open_chat_with_query(hwnd, query: str) -> bool:
+    """
+    Search for `query` in WhatsApp and verify the matching chat
+    actually opened (window title â†’ UIA scan â†’ header OCR).
+    """
+
+    if not _window_is_foreground(hwnd):
+        _activate_window(hwnd)
+
+        time.sleep(0.8)
+
+    press_key(VK_ESCAPE)
+    time.sleep(0.3)
+    press_combo(VK_CONTROL, VK_F)
+    time.sleep(0.6)
+
+    if not _paste_text(query):
+        return False
+
+    time.sleep(1.6)
+
+    # Pick the best search result.
+    press_key(VK_RETURN)
+    time.sleep(1.0)
+
+    # Escape leaves the in-chat search focused on the chat itself.
+    press_key(VK_ESCAPE)
+    time.sleep(0.5)
+
+    # RE-ASSERT FOCUS: OCR/UIA verification must never steal it, but
+    # other windows (VS Code popups, notifications) can steal it from
+    # US. If WhatsApp lost the foreground while we verified, bring it
+    # back BEFORE the caller types the message.
+    if not _window_is_foreground(hwnd):
+        _activate_window(hwnd)
+
+        time.sleep(0.5)
+
+    return _chat_opened(hwnd, query)
+
+
+def _read_search_results(hwnd, query: str, attempts: int = 3):
+    """
+    Read the visible search-results list after `query` was typed into
+    WhatsApp's search box. Pure read â€” nothing is opened or sent.
+    Returns the visible result names, best match first.
+
+    CRITICAL: the window is captured WITHOUT restoring/activating it.
+    _ocr_window_text-style activation would steal focus from the
+    search box mid-send and the subsequent Enter/typing would land
+    in the wrong application. Screen capture reads the pixels even
+    when the window is merely visible, not foreground.
+    """
+
+    query_tokens = [
+        token
+        for token in re.split(r"\s+", query.lower().strip())
+        if token
+    ]
+
+    if not query_tokens:
+        return []
+
+    root_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+    temp_path = os.path.join(root_dir, "data", "_wa_search.png")
+
+    for _attempt in range(max(1, attempts)):
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+            width = max(1, right - left)
+            height = max(1, bottom - top)
+
+            # Minimized windows sit at -25600: nothing to read and
+            # restoring here would steal focus â€” skip quietly.
+            if (
+                left < -20000
+                or top < -20000
+                or right - left < 400
+                or bottom - top < 300
+            ):
+                time.sleep(1.0)
+                continue
+
+            # The chat-list column only: below the search box, left
+            # side, so chat-pane text can never leak into results.
+            strip_right = min(
+                left + max(320, int(width * 0.30)),
+                right,
+            )
+
+            strip_top = top + int(height * 0.10)
+            strip_bottom = top + int(height * 0.80)
+
+            from PIL import ImageGrab
+
+            grab = ImageGrab.grab(
+                bbox=(
+                    left,
+                    strip_top,
+                    strip_right,
+                    strip_bottom,
+                )
+            )
+
+            grab.save(temp_path)
+
+            ocr_lines = _run_ocr_lines(
+                temp_path,
+                grab.size[0],
+                grab.size[1],
+                preserve_case=True,
+            )
+
+        except Exception:
+            ocr_lines = []
+
+        finally:
+            try:
+                os.remove(temp_path)
+
+            except OSError:
+                pass
+
+        # Group OCR rows into visual lines (same y), top to bottom.
+        rows = []
+
+        for x_frac, y_frac, text in sorted(
+            ocr_lines,
+            key=lambda item: item[1],
+        ):
+            if rows and abs(y_frac - rows[-1][0]) < 0.02:
+                rows[-1][1].append((x_frac, text))
+
+            else:
+                rows.append((y_frac, [(x_frac, text)]))
+
+        names = []
+
+        for _y, cells in rows:
+            cells.sort(key=lambda item: item[0])
+
+            line_text = " ".join(
+                text for _x, text in cells
+            ).strip()
+
+            if not line_text:
+                continue
+
+            lowered = " ".join(line_text.lower().split())
+
+            # The contact's NAME line always contains the query (that
+            # is why WhatsApp matched it); message previews and the
+            # chat pane are excluded by the left-column crop above.
+            if not all(
+                token in lowered
+                for token in query_tokens
+            ):
+                continue
+
+            name = _clean_result_name(line_text)
+
+            if len(name) < 2:
+                continue
+
+            if not any(
+                name.lower() == existing.lower()
+                for existing in names
+            ):
+                names.append(name)
+
+        if names:
+            return names[:6]
+
+        time.sleep(1.0)
+
+    return []
+
+
+# ------------------------------------------------------------
+# Public API
+# ------------------------------------------------------------
+
+def send_message(contact: str, message: str) -> dict:
+    """
+    Send a WhatsApp message to a contact/chat.
+
+    Flow: ensure WhatsApp is running (launch it if not), activate the
+    window, focus search (Ctrl+F), paste the contact, pick the chat
+    with Enter, verify the chat really opened, paste the message,
+    send with Enter.
+    """
+
+    contact = (contact or "").strip()
+    message = (message or "").strip()
+
+    if not contact or not message:
+        return {
+            "success": False,
+            "error": "I need both a contact and a message to send.",
+        }
+
+    hwnd = _ensure_window()
+
+    if hwnd is None:
+        if is_whatsapp_running():
+            return {
+                "success": False,
+                "error": (
+                    "I couldn't bring the WhatsApp window to the front."
+                ),
+            }
+
+        return {
+            "success": False,
+            "error": (
+                "I couldn't open WhatsApp. Please open it and sign "
+                "in first, then ask me again."
+            ),
+        }
+
+    # ------------------------------------------------
+    # CONTACT SEARCH WITH RETRY: WhatsApp stores contacts in many
+    # forms ("Vishwa", "Vishwa Bhaiya", "+91 98765 43210"). One
+    # exact-name search misses most of them, so we try progressively
+    # looser queries and verify the chat title after each attempt.
+    # ------------------------------------------------
+    base_words = contact.split()
+
+    queries = [contact]
+
+    if len(base_words) > 1:
+        queries.append(base_words[0])
+
+    cleaned = re.sub(r"[^\w\s]", "", contact).strip()
+
+    if cleaned and cleaned.lower() != contact.lower():
+        queries.append(cleaned)
+
+    opened = False
+    matched_query = contact
+
+    for query in queries:
+        if _open_chat_with_query(hwnd, query):
+            opened = True
+            matched_query = query
+
+            break
+
+        # Clear the search box so the next attempt starts fresh.
+        press_key(VK_ESCAPE)
+        time.sleep(0.2)
+
+    if not opened:
+        if _whatsapp_offline(hwnd):
+            return {
+                "success": False,
+                "error": (
+                    "WhatsApp on your computer can't reach your phone "
+                    "right now, so I can't send messages. Please check "
+                    "your phone has internet and is connected, then "
+                    "ask me again."
+                ),
+            }
+
+        # Offer what the search ACTUALLY showed: the user confirms
+        # which visible contact to message instead of guessing
+        # spellings ("Vishwa High" was visible in the list while the
+        # plain "Vishwa" query failed to open a chat).
+        visible = _read_search_results(
+            hwnd,
+            queries[0] if queries else contact,
+            attempts=1,
+        )
+
+        if visible:
+            return {
+                "success": False,
+                "error": (
+                    f"I found {len(visible)} chats similar to {contact} "
+                    "but couldn't open the exact chat, so I did NOT send "
+                    "anything. Similar contacts: "
+                    + ", ".join(visible[:5])
+                    + ". Which one should I message?"
+                ),
+                "contact_matches": visible,
+            }
+
+        return {
+            "success": False,
+            "error": (
+                f"I searched for {contact} but couldn't find the chat, "
+                "so I did NOT send anything. Please check the contact "
+                "name and try again."
+            ),
+        }
+
+    # The chat is verified open, but focus may have drifted while
+    # verification ran (notifications, popups). The message MUST be
+    # typed into WhatsApp's composer, so re-assert the foreground.
+    if not _window_is_foreground(hwnd):
+        if not _activate_window(hwnd):
+            return {
+                "success": False,
+                "error": (
+                    "The chat opened but I lost the window focus before "
+                    "I could type â€” nothing was sent. Try again, sir."
+                ),
+            }
+
+    # Click into the message composer area before typing: the chat
+    # list or search box could hold focus after Escape. The composer
+    # sits in the lower half of the right (chat) pane.
+    try:
+        left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+        width = max(1, right - left)
+        height = max(1, bottom - top)
+
+        import win32api
+
+        win32api.SetCursorPos(
+            (
+                left + int(width * 0.60),
+                top + int(height * 0.88),
+            )
+        )
+
+        user32.mouse_event(
+            0x0002, 0, 0, 0, 0
+        )  # MOUSEEVENTF_LEFTDOWN
+
+        user32.mouse_event(
+            0x0004, 0, 0, 0, 0
+        )  # MOUSEEVENTF_LEFTUP
+
+        time.sleep(0.4)
+
+    except Exception:
+        pass
+
+    if not _paste_text(message):
+        return {
+            "success": False,
+            "error": "I couldn't use the clipboard to type the message.",
+        }
+
+    time.sleep(0.5)
+
+    press_key(VK_RETURN)
+    time.sleep(1.0)
+
+    # SEND VERIFICATION: the message must actually appear in the
+    # chat. OCR the conversation area and look for the message text
+    # (or its first words). Without this, a focus loss could "send"
+    # into the void while JARVIS claims success.
+    sent_verified = False
+
+    try:
+        check_words = [
+            word.lower()
+            for word in message.split()[:4]
+            if len(word) > 2
+        ]
+
+        if check_words:
+            for _attempt in range(2):
+                ocr_lines = _read_chat_area(hwnd)
+
+                chat_text = " ".join(
+                    text for _x, _y, text in ocr_lines
+                )
+
+                if all(word in chat_text for word in check_words):
+                    sent_verified = True
+                    break
+
+                time.sleep(1.0)
+
+    except Exception:
+        pass
+
+    if not sent_verified:
+        # Not proven delivered: be honest instead of optimistic. The
+        # chat IS open, so the user can glance and hit Enter if the
+        # message is sitting in the composer.
+        return {
+            "success": False,
+            "error": (
+                f"The chat with {matched_query} is open, but I couldn't "
+                "confirm the message actually went through. Please check "
+                "the composer â€” if it's still sitting there, one Enter "
+                "sends it."
+            ),
+        }
+
+    return {
+        "success": True,
+        "message": (
+            f"Message sent to {matched_query} on WhatsApp."
+        ),
+    }
+
+
+def _read_chat_area(hwnd, attempts: int = 1):
+    """
+    OCR the conversation (right) pane WITHOUT touching focus. Used
+    to verify a sent message actually appears in the chat.
+    """
+
+    root_dir = os.path.dirname(
+        os.path.dirname(os.path.abspath(__file__))
+    )
+
+    temp_path = os.path.join(root_dir, "data", "_wa_chat.png")
+
+    lines = []
+
+    for _attempt in range(max(1, attempts)):
+        try:
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+
+            width = max(1, right - left)
+            height = max(1, bottom - top)
+
+            if (
+                left < -20000
+                or top < -20000
+                or right - left < 400
+                or bottom - top < 300
+            ):
+                continue
+
+            from PIL import ImageGrab
+
+            grab = ImageGrab.grab(
+                bbox=(
+                    left + int(width * 0.30),
+                    top + int(height * 0.12),
+                    right,
+                    top + int(height * 0.85),
+                )
+            )
+
+            grab.save(temp_path)
+
+            lines = _run_ocr_lines(
+                temp_path,
+                grab.size[0],
+                grab.size[1],
+                preserve_case=False,
+            )
+
+        except Exception:
+            lines = []
+
+        finally:
+            try:
+                os.remove(temp_path)
+
+            except OSError:
+                pass
+
+        if lines:
+            break
+
+        time.sleep(0.8)
+
+    return lines
+
+
+def search_contacts(query: str, alias_fallback: bool = True) -> dict:
+    """
+    Search WhatsApp chats by name WITHOUT opening a chat or sending
+    anything: type the query into the search box, then read the
+    visible result list (left column) with OCR. Used for the clarify
+    flow when several contacts match a spoken name.
+
+    When the direct query reads nothing, saved memory aliases are
+    tried ("mummy" -> whatever the user taught: e.g. a stored real
+    name), because WhatsApp only matches what is in the contact list.
+    """
+
+    query = (query or "").strip()
+
+    if not query:
+        return {
+            "success": False,
+            "error": "I need a name to search WhatsApp for.",
+        }
+
+    result = _search_contacts_raw(query)
+
+    if (
+        result.get("success")
+        or not alias_fallback
+    ):
+        return result
+
+    # ------------------------------------------------
+    # ALIAS FALLBACK: household names like "mummy", "papa",
+    # "bhaiya" are rarely stored verbatim in WhatsApp. Saved memory
+    # facts supply the real name: "remember that mummy means
+    # Anisha" or "mummy is Anisha Gupta" turns the spoken alias
+    # into something WhatsApp's search can match.
+    # ------------------------------------------------
+    try:
+        from assistant.memory import MemoryStore
+
+        facts = MemoryStore().recall(query).get("results") or []
+
+    except Exception:
+        return result
+
+    for fact in facts:
+        fact_text = str(fact)
+
+        match = re.search(
+            r"[\w\s]{2,40}?(?:\bfor\b|\bmeans\b|\bis\b)\s+"
+            r"([A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?)",
+            fact_text,
+        )
+
+        if not match:
+            continue
+
+        aliased = match.group(1).strip()
+
+        if aliased.lower() == query.lower():
+            continue
+
+        retry = _search_contacts_raw(aliased)
+
+        if retry.get("success"):
+            retry["resolved_alias"] = aliased
+
+            return retry
+
+    return result
+
+
+def _search_contacts_raw(query: str) -> dict:
+    """
+    The original search: type into WhatsApp's search box and OCR the
+    result list. No alias handling.
+    """
+
+    query = (query or "").strip()
+
+    if not query:
+        return {
+            "success": False,
+            "error": "I need a name to search WhatsApp for.",
+        }
+
+    hwnd = _ensure_window()
+
+    if hwnd is None:
+        if is_whatsapp_running():
+            return {
+                "success": False,
+                "error": (
+                    "I couldn't bring the WhatsApp window to the front."
+                ),
+            }
+
+        return {
+            "success": False,
+            "error": (
+                "I couldn't open WhatsApp. Please open it and sign "
+                "in first, then ask me again."
+            ),
+        }
+
+    if not _window_is_foreground(hwnd):
+        _activate_window(hwnd)
+
+        time.sleep(0.8)
+
+    press_key(VK_ESCAPE)
+    time.sleep(0.3)
+    press_combo(VK_CONTROL, VK_F)
+    time.sleep(0.6)
+
+    if not _paste_text(query):
+        return {
+            "success": False,
+            "error": "I couldn't use the clipboard for the search.",
+        }
+
+    time.sleep(1.8)
+
+    names = _read_search_results(hwnd, query)
+
+    # Close the search overlay; never leave WhatsApp mid-search.
+    press_key(VK_ESCAPE)
+    time.sleep(0.3)
+
+    if not names:
+        if _whatsapp_offline(hwnd):
+            return {
+                "success": False,
+                "error": (
+                    "WhatsApp on your computer can't reach your phone "
+                    "right now, so I can't read your chats. Please check "
+                    "your phone is connected, then ask me again."
+                ),
+            }
+
+        return {
+            "success": False,
+            "error": (
+                f"I searched WhatsApp for {query} but couldn't read "
+                "any matching chats."
+            ),
+        }
+
+    return {
+        "success": True,
+        "query": query,
+        "contacts": names,
+        "message": (
+            f"I found {len(names)} matching chats: "
+            + ", ".join(names[:5])
+            + "."
+        ),
+    }
+
+
+if __name__ == "__main__":
+    print("WhatsApp running:", is_whatsapp_running())
+    print("Window:", find_whatsapp_window())
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\tools\__init__.py =====
+

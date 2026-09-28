@@ -17,7 +17,30 @@ Rules (from the v4 master brief):
   6-second follow-up drop are gone).
 """
 
+import os
 import time
+from datetime import datetime
+
+
+# Session transition audit: data/logs/session.log. Every state change
+# lands here with a timestamp and reason so "why did he sleep" is
+# always answerable from evidence (v4.1 Session A2).
+_LOG_PATH = os.path.join("data", "logs", "session.log")
+
+
+def _log_transition(old, new, reason):
+    try:
+        os.makedirs(os.path.dirname(_LOG_PATH), exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        with open(_LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(
+                f"{stamp} {old} -> {new} ({reason})\n"
+            )
+
+    except Exception:
+        pass
 
 
 class SessionState:
@@ -69,6 +92,8 @@ class ConversationSession:
         """DORMANT -> ACTIVE (a wake word or a direct command)."""
 
         if self.state == SessionState.DORMANT:
+            _log_transition("DORMANT", "ACTIVE", reason)
+
             self.state = SessionState.ACTIVE
 
         self._end_reason = None
@@ -87,15 +112,29 @@ class ConversationSession:
         """
 
         if substate in _SUBSTATES and self.state != SessionState.DORMANT:
+            if self.state != substate:
+                _log_transition(self.state, substate, "activity")
+
             self.state = substate
 
         elif substate == SessionState.ACTIVE:
+            if self.state != SessionState.ACTIVE:
+                _log_transition(self.state, "ACTIVE", "activity")
+
             self.state = SessionState.ACTIVE
 
         self.touch()
 
     def end(self, reason: str = "dismissed"):
         """Explicit end: goodbye, emergency stop, self-shutdown."""
+
+        if self.state != SessionState.DORMANT:
+            _log_transition(
+                self.state,
+                "DORMANT",
+                f"{reason} (idle {self.idle_seconds():.0f}s, "
+                f"busy={self.is_busy()})",
+            )
 
         self.state = SessionState.DORMANT
 

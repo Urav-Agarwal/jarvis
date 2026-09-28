@@ -75,23 +75,35 @@ class TextToSpeech:
         """
         Speak text. Returns True if it finished, False if interrupted
         by stop_speaking().
+
+        DUCK SAFETY (audio_doctor found this): the duck flag is only
+        valid DURING a barge-in judgement. Clear it on entry and on
+        exit so a stuck flag can never leave every later reply at 20%
+        volume — that was the "I cannot hear JARVIS" bug.
         """
 
         self.stop_event.clear()
 
+        self.duck_event.clear()
+
         if not text:
             return True
 
-        if self.use_elevenlabs:
-            try:
-                return self._speak_elevenlabs(text)
+        try:
+            if self.use_elevenlabs:
+                try:
+                    return self._speak_elevenlabs(text)
 
-            except Exception as error:
-                print(
-                    f"ElevenLabs TTS failed ({error}); using Piper."
-                )
+                except Exception as error:
+                    print(
+                        f"ElevenLabs TTS failed ({error}); using Piper."
+                    )
 
-        return self._speak_piper(text)
+            return self._speak_piper(text)
+
+        finally:
+            # Never leave the duck engaged past the utterance.
+            self.duck_event.clear()
 
     def stop_speaking(self):
         """Interrupt current speech from any thread."""

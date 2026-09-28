@@ -1,5 +1,6 @@
 import json
 import re
+import time
 
 from ai.tool_catalogue import ToolCatalogue
 from ai.plan_parser import PlanParser
@@ -485,7 +486,20 @@ User request:
 """
 
         try:
+            _t0 = time.perf_counter()
+
             response = self.provider.generate(prompt)
+
+            # v4.1 latency: duration of THIS reasoning call. The
+            # runtime reads total_llm_ms after the loop to feed the
+            # exchange trace (last = debugging, total = the trace).
+            spent_ms = (time.perf_counter() - _t0) * 1000.0
+
+            self.last_llm_ms = spent_ms
+
+            self.total_llm_ms = (
+                getattr(self, "total_llm_ms", 0.0) + spent_ms
+            )
 
         except InterruptedError:
             # User said "stop"/"hey Jarvis" mid-think: surface it to

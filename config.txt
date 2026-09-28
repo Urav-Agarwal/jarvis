@@ -1,11 +1,8 @@
+﻿
+===== C:\Users\Urav Agarwal\Projects\Jarvis\config\settings.yaml =====
+
 # JARVIS runtime settings.
 # Values here are defaults; environment variables in .env hold secrets.
-
-session:
-  # v4: the conversation stays ACTIVE across tasks and follow-ups.
-  # JARVIS returns to wake-word mode only after this many seconds of
-  # silence (never mid-task, never while a confirmation pends).
-  idle_timeout_seconds: 300
 
 audio:
   # Microphone device index (null = system default).
@@ -18,15 +15,9 @@ audio:
 
 wake_word:
   model: hey_jarvis
-  # v4.1 sensitivity preset: low / medium / high. "high" wakes from a
-  # normal speaking voice at desk distance (threshold 0.22); the
-  # two-frame confirmation and the post-speech cooldown keep false
-  # wakes down. Explicit threshold overrides the preset if set.
-  sensitivity: high
+  # Detection sensitivity: fraction of the model's raw score needed
+  # to fire. Lower = more sensitive (catches quiet/fast speech).
   threshold: 0.35
-  # Automatic gain control before the model (default on): normalises
-  # quiet mics so normal-volume speech reaches the detector.
-  agc: true
 
 speech:
   # Local fallback whisper model (Groq turbo is used automatically
@@ -40,9 +31,6 @@ agent:
   # Personality tone: formal / balanced / witty. Changes phrasing,
   # not competence. (v2 personality layer)
   tone: balanced
-  # v4: reasoning-step budget per request (the v3 fixed cap was 4 —
-  # too small for real multi-step tasks). Hard-clamped to 25.
-  max_reasoning_steps: 12
   # Proactive mode: JARVIS mentions low battery, high CPU, or an
   # event about to start without being asked.
   proactive_mode: true
@@ -56,3 +44,6 @@ memory:
 
 skills:
   path: data/skills.json
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\config\__init__.py =====
+

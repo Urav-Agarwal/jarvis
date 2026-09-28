@@ -1,0 +1,2273 @@
+﻿
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\conversation.py =====
+
+"""
+Conversation view for the JARVIS window.
+
+Modern chat-style layout: rounded speech bubbles (user right/teal,
+JARVIS left/slate), timestamps, auto-scroll, dark glass theme.
+"""
+
+from datetime import datetime
+
+from PySide6.QtCore import (
+    QEasingCurve,
+    QPropertyAnimation,
+    Qt,
+)
+from PySide6.QtWidgets import (
+    QFrame,
+    QGraphicsOpacityEffect,
+    QHBoxLayout,
+    QLabel,
+    QScrollArea,
+    QVBoxLayout,
+    QWidget,
+)
+
+_STYLE = """
+QScrollArea {
+    background: transparent;
+    border: none;
+}
+
+QLabel#avatarUser {
+    background-color: qlineargradient(x1:0 y1:0, x2:1 y2:1,
+        stop:0 #0e7490, stop:1 #155e75);
+    color: #ecfeff;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: 700;
+}
+
+QLabel#avatarJarvis {
+    background-color: qlineargradient(x1:0 y1:0, x2:1 y2:1,
+        stop:0 #22d3ee, stop:1 #2563eb);
+    color: #06121c;
+    border-radius: 14px;
+    font-size: 12px;
+    font-weight: 800;
+}
+
+QLabel#bubbleUser {
+    background-color: qlineargradient(x1:0 y1:0, x2:1 y2:1,
+        stop:0 #0e7490, stop:1 #0c5a70);
+    color: #ecfeff;
+    border-radius: 14px;
+    border-bottom-left-radius: 14px;
+    border-bottom-right-radius: 4px;
+    padding: 10px 14px;
+    font-size: 14px;
+}
+
+QLabel#bubbleJarvis {
+    background-color: rgba(19, 28, 40, 215);
+    color: #dbeafe;
+    border: 1px solid #1e2c3d;
+    border-radius: 14px;
+    border-bottom-left-radius: 4px;
+    border-bottom-right-radius: 14px;
+    padding: 10px 14px;
+    font-size: 14px;
+}
+
+QLabel#bubbleName {
+    color: #7dd3fc;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    background: transparent;
+}
+
+QLabel#bubbleNameUser {
+    color: #67e8f9;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 1px;
+    background: transparent;
+}
+
+QLabel#bubbleTime {
+    color: #46586e;
+    font-size: 10px;
+    background: transparent;
+}
+
+QLabel#typingBubble {
+    background-color: rgba(19, 28, 40, 215);
+    color: #67e8f9;
+    border: 1px solid #1e2c3d;
+    border-radius: 12px;
+    padding: 8px 14px;
+    font-size: 13px;
+    letter-spacing: 3px;
+}
+"""
+
+
+class ConversationView(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setStyleSheet(_STYLE)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.NoFrame)
+
+        self.container = QWidget()
+        self.container.setStyleSheet("background: transparent;")
+
+        self.messages_layout = QVBoxLayout(self.container)
+        self.messages_layout.setContentsMargins(4, 4, 4, 4)
+        self.messages_layout.setAlignment(Qt.AlignTop)
+        self.messages_layout.setSpacing(10)
+
+        self.scroll.setWidget(self.container)
+
+        main_layout = QVBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.addWidget(self.scroll)
+
+        # Persistent typing indicator, hidden until JARVIS thinks.
+        self.typing_label = QLabel("â— â— â—")
+        self.typing_label.setObjectName("typingBubble")
+        self.typing_label.hide()
+
+        self._typing_row = QHBoxLayout()
+        self._typing_row.addWidget(self._make_avatar(is_user=False))
+        self._typing_row.addWidget(self.typing_label)
+        self._typing_row.addStretch(1)
+
+        self.messages_layout.addLayout(self._typing_row)
+
+        self._add_welcome()
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def add_user_message(self, message: str):
+        self._add_message("YOU", message, is_user=True)
+
+    def add_jarvis_message(self, message: str):
+        self._add_message("JARVIS", message, is_user=False)
+
+    def show_typing(self):
+        self.typing_label.show()
+        self._scroll_to_bottom()
+
+    def hide_typing(self):
+        self.typing_label.hide()
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    @staticmethod
+    def _make_avatar(is_user: bool) -> QLabel:
+        avatar = QLabel("Y" if is_user else "J")
+
+        avatar.setObjectName("avatarUser" if is_user else "avatarJarvis")
+        avatar.setFixedSize(28, 28)
+        avatar.setAlignment(Qt.AlignCenter)
+
+        return avatar
+
+    def _add_welcome(self):
+        welcome = QLabel(
+            'Say "Hey JARVIS" and ask me anything â€”\nI\'m listening.'
+        )
+
+        welcome.setObjectName("bubbleJarvis")
+        welcome.setWordWrap(True)
+        welcome.setMaximumWidth(520)
+
+        row = QHBoxLayout()
+        row.addWidget(self._make_avatar(is_user=False))
+        row.addWidget(welcome)
+        row.addStretch(1)
+
+        self.messages_layout.addLayout(row)
+
+    def _add_message(self, sender: str, message: str, is_user: bool):
+        bubble = QLabel(message)
+
+        bubble.setObjectName("bubbleUser" if is_user else "bubbleJarvis")
+        bubble.setWordWrap(True)
+        bubble.setTextInteractionFlags(
+            Qt.TextSelectableByMouse
+        )
+        bubble.setMaximumWidth(480)
+
+        self._animate_in(bubble)
+
+        timestamp = datetime.now().strftime("%H:%M")
+
+        name = QLabel(sender)
+        name.setObjectName("bubbleNameUser" if is_user else "bubbleName")
+
+        time_label = QLabel(timestamp)
+        time_label.setObjectName("bubbleTime")
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(2)
+
+        meta_row = QHBoxLayout()
+        meta_row.setSpacing(8)
+
+        if is_user:
+            meta_row.addStretch(1)
+            meta_row.addWidget(time_label)
+            meta_row.addWidget(name)
+        else:
+            meta_row.addWidget(name)
+            meta_row.addWidget(time_label)
+            meta_row.addStretch(1)
+
+        text_column.addLayout(meta_row)
+        text_column.addWidget(bubble)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)
+
+        if is_user:
+            row.addStretch(1)
+            row.addLayout(text_column)
+            row.addWidget(self._make_avatar(is_user=True), 0, Qt.AlignBottom)
+        else:
+            row.addWidget(self._make_avatar(is_user=False), 0, Qt.AlignBottom)
+            row.addLayout(text_column)
+            row.addStretch(1)
+
+        self.messages_layout.addLayout(row)
+
+        self._scroll_to_bottom()
+
+    def _animate_in(self, bubble: QLabel):
+        """Fade + rise entrance for new bubbles (600ms, smooth)."""
+
+        effect = QGraphicsOpacityEffect(bubble)
+        bubble.setGraphicsEffect(effect)
+
+        animation = QPropertyAnimation(effect, b"opacity", bubble)
+        animation.setDuration(600)
+        animation.setStartValue(0.0)
+        animation.setEndValue(1.0)
+        animation.setEasingCurve(QEasingCurve.OutCubic)
+
+        animation.start(QPropertyAnimation.DeleteWhenStopped)
+
+    def _scroll_to_bottom(self):
+        scrollbar = self.scroll.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\core.py =====
+
+"""
+The JARVIS core v2: a state-driven cinematic orb.
+
+Layered glass sphere with a swirling energy core, counter-rotating
+arc rings, drifting particles, an orbiting satellite ring while
+thinking, waveform bars while speaking, and a checkmark flash on
+completion. Animation intensity, speed, and extras are driven by the
+agent state (set_state), matching the Iron-Man HUD reference.
+
+Bugs fixed vs v1:
+- The 30ms animation timer now STOPS when the widget is hidden
+  (it used to burn CPU forever in the background).
+- The sonar-pulse list is cleared on hide (it could grow unbounded).
+- State changes actually change the animation (v1 only changed the
+  color; idle spun as fast as executing).
+"""
+
+import math
+import random
+import time
+
+from PySide6.QtCore import (
+    QPointF,
+    QRectF,
+    QTimer,
+    Qt,
+)
+from PySide6.QtGui import (
+    QColor,
+    QConicalGradient,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QRadialGradient,
+)
+from PySide6.QtWidgets import QWidget
+
+
+class JarvisCore(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setMinimumSize(220, 220)
+
+        # Emerald default (mockup); color still morphs per state.
+        self.color = QColor("#34d399")
+        self._target_color = QColor("#34d399")
+
+        self._state = "IDLE"
+
+        # Per-state animation profile.
+        self._PROFILE = {
+            "IDLE": {
+                "breath_speed": 0.9, "ring_speed": 0.35,
+                "core_alpha": 150, "glow": 0.55, "particles": 8,
+            },
+            "LISTENING": {
+                "breath_speed": 1.8, "ring_speed": 0.9,
+                "core_alpha": 195, "glow": 0.9, "particles": 14,
+            },
+            "THINKING": {
+                "breath_speed": 2.4, "ring_speed": 1.8,
+                "core_alpha": 215, "glow": 1.0, "particles": 12,
+                "satellite": True,
+            },
+            "EXECUTING": {
+                "breath_speed": 2.1, "ring_speed": 1.5,
+                "core_alpha": 205, "glow": 0.95, "particles": 12,
+                "satellite": True,
+            },
+            "WAITING_FOR_CONFIRMATION": {
+                "breath_speed": 1.3, "ring_speed": 0.5,
+                "core_alpha": 185, "glow": 0.7, "particles": 9,
+            },
+            "SPEAKING": {
+                "breath_speed": 1.7, "ring_speed": 0.7,
+                "core_alpha": 200, "glow": 0.95, "particles": 16,
+                "waveform": True,
+            },
+            "DONE": {
+                "breath_speed": 1.2, "ring_speed": 0.4,
+                "core_alpha": 190, "glow": 0.8, "particles": 10,
+                "checkmark": True,
+            },
+            "SHUTTING_DOWN": {
+                "breath_speed": 0.5, "ring_speed": 0.2,
+                "core_alpha": 120, "glow": 0.4, "particles": 5,
+            },
+        }
+
+        # Sonar pulses: spawn times.
+        self._pulses = []
+        self._last_pulse = 0.0
+
+        # Drifting particles.
+        self._particles = []
+        self._seed_particles()
+
+        # Done-flash timestamp.
+        self._done_at = 0.0
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.animate)
+        self.timer.start(30)
+
+    # --------------------------------------------------
+    # PUBLIC API
+    # --------------------------------------------------
+
+    def set_state_color(self, color_hex: str):
+        """Legacy API: color morph target."""
+        self._target_color = QColor(color_hex)
+
+    def set_state(self, state: str):
+        """Drive the animation profile from the agent state."""
+        if state in self._PROFILE:
+            self._state = state
+
+            if state == "DONE":
+                self._done_at = time.time()
+
+    # --------------------------------------------------
+    # LIFECYCLE BUG FIXES
+    # --------------------------------------------------
+
+    def hideEvent(self, event):
+        # v1 bug: the timer ran at 30ms forever, even hidden.
+        self.timer.stop()
+        self._pulses.clear()
+        super().hideEvent(event)
+
+    def showEvent(self, event):
+        self.timer.start(30)
+        super().showEvent(event)
+
+    # --------------------------------------------------
+    # PARTICLES
+    # --------------------------------------------------
+
+    def _seed_particles(self):
+        self._particles = []
+
+        for _ in range(18):
+            self._particles.append(
+                {
+                    "angle": random.uniform(0, math.tau),
+                    "radius": random.uniform(0.45, 1.25),
+                    "speed": random.uniform(0.05, 0.22),
+                    "size": random.uniform(1.2, 2.8),
+                    "phase": random.uniform(0, math.tau),
+                }
+            )
+
+    # --------------------------------------------------
+    # FRAME
+    # --------------------------------------------------
+
+    def animate(self):
+        now = time.time()
+
+        # Color easing toward the state color.
+        self.color.setRed(
+            int(
+                self.color.red()
+                + (self._target_color.red() - self.color.red()) * 0.08
+            )
+        )
+        self.color.setGreen(
+            int(
+                self.color.green()
+                + (self._target_color.green() - self.color.green()) * 0.08
+            )
+        )
+        self.color.setBlue(
+            int(
+                self.color.blue()
+                + (self._target_color.blue() - self.color.blue()) * 0.08
+            )
+        )
+
+        profile = self._PROFILE.get(
+            self._state,
+            self._PROFILE["IDLE"],
+        )
+
+        # Sonar pulse cadence scales with state energy.
+        pulse_period = max(1.2, 3.2 - profile["ring_speed"])
+
+        if now - self._last_pulse > pulse_period:
+            self._last_pulse = now
+            self._pulses.append(now)
+
+        # Retire finished pulses.
+        self._pulses = [
+            pulse for pulse in self._pulses if now - pulse < 2.0
+        ]
+
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        center = self.rect().center()
+        side = min(self.width(), self.height())
+
+        scale = side / 260.0
+
+        t = time.time()
+        profile = self._PROFILE.get(
+            self._state,
+            self._PROFILE["IDLE"],
+        )
+
+        breath_speed = profile["breath_speed"]
+        ring_speed = profile["ring_speed"]
+
+        breath = (math.sin(t * breath_speed) + 1) / 2
+
+        core_radius = (44 + breath * 5) * scale
+        sphere_radius = 74 * scale
+        ring_base = 96 * scale
+
+        # --------------------------------------------------
+        # 1. Ambient glow (scales with state energy)
+        # --------------------------------------------------
+        glow_radius = ring_base * (1.75 + profile["glow"] * 0.35)
+
+        glow = QRadialGradient(center, glow_radius)
+
+        glow_color = QColor(self.color)
+        glow_color.setAlpha(
+            int((18 + breath * 16) * profile["glow"])
+        )
+
+        glow.setColorAt(0.0, glow_color)
+
+        fade = QColor(self.color)
+        fade.setAlpha(0)
+
+        glow.setColorAt(1.0, fade)
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(glow)
+        painter.drawEllipse(center, glow_radius, glow_radius)
+
+        # --------------------------------------------------
+        # 2. Two counter-rotating conical arc rings
+        # --------------------------------------------------
+        rings = [
+            (ring_base, ring_speed, 150, 3.0),
+            (ring_base * 0.88, -ring_speed * 1.5, 100, 2.2),
+        ]
+
+        for radius, speed, alpha, width in rings:
+            angle = (t * speed * 57.3) % 360
+
+            gradient = QConicalGradient(center, -angle)
+
+            start = QColor(self.color)
+            start.setAlpha(alpha)
+
+            end = QColor(self.color)
+            end.setAlpha(0)
+
+            gradient.setColorAt(0.0, start)
+            gradient.setColorAt(0.32, end)
+            gradient.setColorAt(1.0, end)
+
+            painter.setPen(
+                QPen(
+                    gradient,
+                    width * scale,
+                    Qt.SolidLine,
+                    Qt.RoundCap,
+                )
+            )
+            painter.setBrush(Qt.NoBrush)
+
+            painter.drawEllipse(center, radius, radius)
+
+        # --------------------------------------------------
+        # 3. THINKING/EXECUTING: orbiting satellite ring
+        # --------------------------------------------------
+        if profile.get("satellite"):
+            painter.save()
+
+            painter.translate(center)
+
+            # Tilted elliptical orbit, precessing slowly.
+            painter.rotate(18 * math.sin(t * 0.6))
+
+            orbit_rx = sphere_radius * 1.28
+            orbit_ry = sphere_radius * 0.42
+
+            orbit_pen = QColor(self.color)
+            orbit_pen.setAlpha(120)
+
+            painter.setPen(QPen(orbit_pen, 1.8 * scale))
+            painter.setBrush(Qt.NoBrush)
+
+            painter.drawEllipse(QPointF(0, 0), orbit_rx, orbit_ry)
+
+            # Satellite dot riding the orbit.
+            sat_angle = t * 2.4
+
+            sat_x = orbit_rx * math.cos(sat_angle)
+            sat_y = orbit_ry * math.sin(sat_angle)
+
+            sat_color = QColor(255, 255, 255, 230)
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(sat_color)
+
+            painter.drawEllipse(
+                QPointF(sat_x, sat_y),
+                3.4 * scale,
+                3.4 * scale,
+            )
+
+            painter.restore()
+
+        # --------------------------------------------------
+        # 4. SPEAKING: waveform bars flanking the sphere
+        # --------------------------------------------------
+        if profile.get("waveform"):
+            bar_count = 4
+
+            for side_sign in (-1, 1):
+                base_x = center.x() + side_sign * (
+                    sphere_radius + 16 * scale
+                )
+
+                for index in range(bar_count):
+                    offset = index * 9 * scale
+
+                    wave = (
+                        math.sin(
+                            t * 9 + index * 1.4 + side_sign
+                        )
+                        + 1
+                    ) / 2
+
+                    bar_height = (8 + wave * 26) * scale
+
+                    bar_color = QColor(self.color)
+                    bar_color.setAlpha(90 + int(wave * 130))
+
+                    painter.setPen(Qt.NoPen)
+                    painter.setBrush(bar_color)
+
+                    bar_x = base_x + side_sign * offset
+
+                    painter.drawRoundedRect(
+                        QRectF(
+                            bar_x - 1.8 * scale,
+                            center.y() - bar_height / 2,
+                            3.6 * scale,
+                            bar_height,
+                        ),
+                        2,
+                        2,
+                    )
+
+        # --------------------------------------------------
+        # 5. Drifting particles
+        # --------------------------------------------------
+        painter.setPen(Qt.NoPen)
+
+        target_particles = profile["particles"]
+
+        for index, particle in enumerate(self._particles):
+            if index >= target_particles:
+                break
+
+            particle["angle"] += (
+                particle["speed"] * 0.016 * (1 + ring_speed)
+            )
+
+            radius = (
+                particle["radius"]
+                + 0.05 * math.sin(t + particle["phase"])
+            )
+
+            x = center.x() + radius * (
+                sphere_radius * 1.35
+            ) * math.cos(particle["angle"])
+
+            y = center.y() + radius * (
+                sphere_radius * 1.35
+            ) * math.sin(particle["angle"]) * 0.96
+
+            alpha = 40 + int(
+                70 * (math.sin(t * 2 + particle["phase"]) + 1) / 2
+            )
+
+            dot = QColor(self.color)
+            dot.setAlpha(alpha)
+
+            painter.setBrush(dot)
+
+            painter.drawEllipse(
+                QPointF(x, y),
+                particle["size"] * scale,
+                particle["size"] * scale,
+            )
+
+        # --------------------------------------------------
+        # 6. Glass sphere: body, inner swirl, rim light
+        # --------------------------------------------------
+        body = QRadialGradient(
+            center.x() - core_radius * 0.3,
+            center.y() - core_radius * 0.4,
+            sphere_radius * 1.35,
+        )
+
+        body_edge = QColor(self.color)
+        body_edge.setAlpha(profile["core_alpha"])
+
+        body.setColorAt(0.0, QColor(255, 255, 255, 60))
+        body.setColorAt(0.55, QColor(10, 30, 26, 150))
+        body.setColorAt(1.0, body_edge)
+
+        painter.setBrush(body)
+        painter.setPen(Qt.NoPen)
+
+        painter.drawEllipse(center, sphere_radius, sphere_radius)
+
+        # Inner swirl: two spiral arcs clipped to the sphere.
+        painter.save()
+
+        swirl_path = QPainterPath()
+        swirl_path.addEllipse(
+            center,
+            sphere_radius * 0.94,
+            sphere_radius * 0.94,
+        )
+
+        painter.setClipPath(swirl_path)
+
+        painter.translate(center)
+
+        for index, (swirl_speed, swirl_alpha) in enumerate(
+            ((0.8, 170), (-0.55, 120))
+        ):
+            swirl_angle = t * swirl_speed * 57.3
+
+            painter.save()
+
+            painter.rotate(swirl_angle + index * 120)
+
+            swirl_color = QColor(self.color)
+            swirl_color.setAlpha(swirl_alpha)
+
+            painter.setPen(
+                QPen(
+                    swirl_color,
+                    5.5 * scale,
+                    Qt.SolidLine,
+                    Qt.RoundCap,
+                )
+            )
+            painter.setBrush(Qt.NoBrush)
+
+            # Open arc: most of a circle; the gap gives swirl motion.
+            arc_rect = QRectF(
+                -sphere_radius * 0.55,
+                -sphere_radius * 0.55,
+                sphere_radius * 1.1,
+                sphere_radius * 1.1,
+            )
+
+            painter.drawArc(arc_rect, 0, 280 * 16)
+
+            # Arc tip dot: the comet head of the swirl.
+            tip_x = sphere_radius * 0.55
+            tip_y = 0.0
+
+            tip = QColor(self.color)
+            tip.setAlpha(min(255, swirl_alpha + 60))
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(tip)
+
+            painter.drawEllipse(
+                QPointF(tip_x, tip_y),
+                4.2 * scale,
+                4.2 * scale,
+            )
+
+            painter.restore()
+
+        painter.restore()
+
+        # Rim light: bright arc top-left, glass feel.
+        rim_rect = QRectF(
+            center.x() - sphere_radius,
+            center.y() - sphere_radius,
+            sphere_radius * 2,
+            sphere_radius * 2,
+        )
+
+        rim = QColor(255, 255, 255, 170)
+
+        painter.setPen(
+            QPen(rim, 2.4 * scale, Qt.SolidLine, Qt.RoundCap)
+        )
+        painter.setBrush(Qt.NoBrush)
+
+        painter.drawArc(rim_rect, 100 * 16, 80 * 16)
+
+        # Bottom rim reflection, fainter.
+        rim_low = QColor(255, 255, 255, 60)
+
+        painter.setPen(QPen(rim_low, 2.0 * scale))
+
+        painter.drawArc(rim_rect, 280 * 16, 50 * 16)
+
+        # --------------------------------------------------
+        # 7. DONE: checkmark flash
+        # --------------------------------------------------
+        if profile.get("checkmark"):
+            elapsed = time.time() - self._done_at
+
+            if elapsed < 1.6:
+                fade_alpha = int(
+                    255 * max(0.0, 1.0 - elapsed / 1.6)
+                )
+
+                check = QColor(255, 255, 255, fade_alpha)
+
+                painter.setPen(
+                    QPen(
+                        check,
+                        6 * scale,
+                        Qt.SolidLine,
+                        Qt.RoundCap,
+                        Qt.RoundJoin,
+                    )
+                )
+                painter.setBrush(Qt.NoBrush)
+
+                check_size = sphere_radius * 0.42
+
+                painter.drawPolyline(
+                    [
+                        QPointF(
+                            center.x() - check_size * 0.7,
+                            center.y(),
+                        ),
+                        QPointF(
+                            center.x() - check_size * 0.1,
+                            center.y() + check_size * 0.55,
+                        ),
+                        QPointF(
+                            center.x() + check_size * 0.75,
+                            center.y() - check_size * 0.55,
+                        ),
+                    ]
+                )
+
+        # --------------------------------------------------
+        # 8. Outer structure ring
+        # --------------------------------------------------
+        static_ring = QColor(self.color)
+        static_ring.setAlpha(40)
+
+        painter.setPen(QPen(static_ring, 1.2 * scale))
+        painter.setBrush(Qt.NoBrush)
+
+        painter.drawEllipse(
+            center,
+            ring_base * 1.18,
+            ring_base * 1.18,
+        )
+
+        painter.end()
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\hud_widgets.py =====
+
+"""
+Futuristic HUD widgets: audio-style waveform visualizer and circular
+ring gauges for the system telemetry. Pure Qt painting, no deps.
+"""
+
+import math
+import random
+import time
+
+from PySide6.QtCore import QPointF, Qt, QTimer
+from PySide6.QtGui import QColor, QPainter, QPen, QRadialGradient
+from PySide6.QtWidgets import QWidget
+
+
+class Waveform(QWidget):
+    """
+    Living waveform ribbon: symmetric vertical bars driven by layered
+    sine motion + gentle randomness. Amplitude follows the given
+    activity level (0..1) â€” calm when idle, lively when thinking.
+    """
+
+    def __init__(self, bars: int = 28):
+        super().__init__()
+
+        self.setFixedHeight(56)
+        self.bars = bars
+
+        self.level = 0.25
+        self._target_level = 0.25
+
+        self._offsets = [
+            random.uniform(0, math.tau)
+            for _ in range(bars)
+        ]
+
+        self._speeds = [
+            random.uniform(1.6, 3.2)
+            for _ in range(bars)
+        ]
+
+        self._color = QColor("#22d3ee")
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(33)
+
+    def set_color(self, color_hex: str):
+        self._color = QColor(color_hex)
+
+    def set_level(self, level: float):
+        self._target_level = max(0.08, min(1.0, level))
+
+    def _tick(self):
+        self.level += (self._target_level - self.level) * 0.15
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        width = self.width()
+        height = self.height()
+
+        mid = height / 2
+
+        gap = 3
+        bar_width = (width - gap * (self.bars - 1)) / self.bars
+
+        t = time.time()
+
+        for index in range(self.bars):
+            # Layered sine motion with per-bar personality.
+            wave = (
+                math.sin(t * self._speeds[index] + self._offsets[index]) * 0.45
+                + math.sin(t * 0.8 + index * 0.55) * 0.35
+                + math.sin(t * 5.1 + index * 1.7) * 0.2
+            )
+
+            envelope = 0.35 + 0.65 * math.sin(
+                math.pi * (index + 0.5) / self.bars
+            )
+
+            amplitude = max(
+                2.0,
+                abs(wave) * self.level * envelope * (height / 2 - 3),
+            )
+
+            x = index * (bar_width + gap)
+
+            color = QColor(self._color)
+            color.setAlpha(120 + int(110 * (amplitude / (height / 2))))
+
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+
+            painter.drawRoundedRect(
+                x,
+                mid - amplitude,
+                bar_width,
+                amplitude * 2,
+                bar_width / 2,
+                bar_width / 2,
+            )
+
+        painter.end()
+
+
+class RingGauge(QWidget):
+    """
+    Circular progress ring with a centered value label. Clean,
+    futuristic, state-colored.
+    """
+
+    def __init__(self, label: str):
+        super().__init__()
+
+        self.label = label
+        self.percent = 0
+        self._display = 0.0
+
+        self._color = QColor("#22d3ee")
+
+        self.setMinimumSize(74, 74)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(40)
+
+    def set_color(self, color_hex: str):
+        self._color = QColor(color_hex)
+
+    def set_value(self, percent: int, text: str = ""):
+        self.percent = max(0, min(100, int(percent)))
+        self._text = text or f"{self.percent}%"
+
+    def _tick(self):
+        self._display += (self.percent - self._display) * 0.12
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        side = min(self.width(), self.height())
+
+        center = QPointF(self.width() / 2, self.height() / 2)
+        radius = side / 2 - 6
+
+        # Background track.
+        track = QColor("#16273a")
+
+        painter.setPen(QPen(track, 5, Qt.SolidLine, Qt.RoundCap))
+        painter.setBrush(Qt.NoBrush)
+
+        painter.drawEllipse(center, radius, radius)
+
+        # Value arc (sweep from top, clockwise).
+        span = int(-360 * self._display / 100 * 16)
+
+        painter.setPen(
+            QPen(self._color, 5, Qt.SolidLine, Qt.RoundCap)
+        )
+
+        from PySide6.QtCore import QRectF
+
+        painter.drawArc(
+            QRectF(
+                center.x() - radius,
+                center.y() - radius,
+                radius * 2,
+                radius * 2,
+            ),
+            90 * 16,
+            span,
+        )
+
+        # Value text.
+        painter.setPen(QColor("#e6eefb"))
+        font = painter.font()
+        font.setPointSizeF(9.5)
+        font.setBold(True)
+        painter.setFont(font)
+
+        painter.drawText(
+            QRectF(
+                center.x() - radius,
+                center.y() - 14,
+                radius * 2,
+                18,
+            ),
+            Qt.AlignCenter,
+            self._text,
+        )
+
+        # Label text.
+        painter.setPen(QColor("#5b7290"))
+        small = painter.font()
+        small.setPointSizeF(6.5)
+        small.setBold(False)
+        painter.setFont(small)
+
+        painter.drawText(
+            QRectF(
+                center.x() - radius,
+                center.y() + 2,
+                radius * 2,
+                14,
+            ),
+            Qt.AlignCenter,
+            self.label,
+        )
+
+        painter.end()
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\sidebar.py =====
+
+"""
+Left navigation sidebar, mockup-exact: Chat / Apps / Files / Web
+Search / Automation / Reminders / System Control / Notes / Settings
+with icon glyphs, one selected item with a glowing gradient pill,
+and the Urav / JARVIS v1.0 user card at the bottom. Selecting a
+section fires its ready-made command through the chip callback.
+"""
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+_STYLE = """
+QWidget#sidebar {
+    background-color: rgba(9, 14, 26, 225);
+    border: 1px solid #12203a;
+    border-radius: 16px;
+}
+
+QPushButton#navButton {
+    color: #7d94b4;
+    background: transparent;
+    border: none;
+    border-radius: 12px;
+    padding: 11px 14px;
+    font-size: 13px;
+    text-align: left;
+}
+
+QPushButton#navButton:hover {
+    color: #dbeafe;
+    background-color: #0e1c33;
+}
+
+QPushButton#navButton:checked {
+    color: #eaf2ff;
+    background-color: qlineargradient(x1:0 y1:0, x2:1 y2:0,
+        stop:0 rgba(37, 99, 235, 110), stop:1 rgba(56, 189, 248, 45));
+    border: 1px solid #2c5fc4;
+}
+
+QWidget#userCard {
+    background-color: rgba(13, 21, 36, 235);
+    border: 1px solid #1a2c48;
+    border-radius: 14px;
+}
+
+QLabel#userName {
+    color: #eaf2ff;
+    font-size: 13px;
+    font-weight: 600;
+}
+
+QLabel#userSub {
+    color: #54688a;
+    font-size: 10px;
+}
+"""
+
+SECTIONS = [
+    ("Chat", "ðŸ’¬", None),
+    ("Apps", "ðŸš€", "open whatsapp"),
+    ("Files", "ðŸ“", "find my physics notes"),
+    ("Web Search", "ðŸ”", "search the web for today's tech news"),
+    ("Automation", "âš¡", "whenever I say study setup, open Chrome and set volume to 30"),
+    ("Reminders", "ðŸ—“ï¸", "what are my reminders"),
+    ("System Control", "ðŸ–¥ï¸", "how is my laptop doing"),
+    ("Notes", "ðŸ“", "take a note"),
+    ("Settings", "âš™ï¸", "what can you do"),
+]
+
+
+class Sidebar(QWidget):
+    def __init__(self, on_command=None):
+        super().__init__()
+
+        self.on_command = on_command
+
+        self.setObjectName("sidebar")
+        self.setStyleSheet(_STYLE)
+        self.setFixedWidth(186)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 14, 10, 10)
+        layout.setSpacing(4)
+
+        self._buttons = {}
+
+        for name, icon, command in SECTIONS:
+            button = QPushButton(f"{icon}   {name}")
+            button.setObjectName("navButton")
+            button.setCursor(Qt.PointingHandCursor)
+            button.setCheckable(True)
+            button.setChecked(name == "Chat")
+
+            button.clicked.connect(
+                lambda checked, n=name, c=command: self._select(n, c)
+            )
+
+            layout.addWidget(button)
+
+            self._buttons[name] = button
+
+        layout.addStretch(1)
+
+        # ------------------------------------------------
+        # User card (bottom)
+        # ------------------------------------------------
+        card = QWidget()
+        card.setObjectName("userCard")
+
+        from PySide6.QtWidgets import QHBoxLayout
+
+        card_layout = QHBoxLayout(card)
+        card_layout.setContentsMargins(12, 12, 8, 12)
+        card_layout.setSpacing(10)
+
+        avatar = QLabel()
+        avatar.setFixedSize(34, 34)
+        avatar.setAlignment(Qt.AlignCenter)
+        avatar.setStyleSheet(
+            "border-radius: 17px;"
+            "background-color: qradialgradient(cx:0.5 cy:0.42, radius:0.55, "
+            "stop:0 #e0f7ff, stop:0.4 #38bdf8, stop:1 #0b1f3d);"
+            "border: 2px solid #1e4a6d;"
+        )
+
+        text_column = QVBoxLayout()
+        text_column.setSpacing(1)
+
+        name = QLabel("Urav")
+        name.setObjectName("userName")
+
+        sub = QLabel("JARVIS v1.0")
+        sub.setObjectName("userSub")
+
+        text_column.addWidget(name)
+        text_column.addWidget(sub)
+
+        arrow = QLabel("â€º")
+        arrow.setStyleSheet("color: #54688a; font-size: 16px;")
+
+        card_layout.addWidget(avatar)
+        card_layout.addLayout(text_column, 1)
+        card_layout.addWidget(arrow)
+
+        layout.addWidget(card)
+
+    def _select(self, name: str, command):
+        # Radio behavior: exactly one active section.
+        for other_name, button in self._buttons.items():
+            button.setChecked(other_name == name)
+
+        if command and self.on_command is not None:
+            self.on_command(command)
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\system_rail.py =====
+
+"""
+Right-hand system rail, mockup-exact: SYSTEM STATUS (four ring
+gauges + running badge), CURRENT MODE (status pill + waveform),
+QUICK ACTIONS (3x2 icon-tile grid), and RECENT ACTIVITY (icon
+rows with relative timestamps). Pure psutil polling â€” no LLM.
+"""
+
+import time
+
+import psutil
+
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ui.components.hud_widgets import Waveform
+
+
+_STYLE = """
+QWidget#railCard {
+    background-color: rgba(12, 19, 34, 225);
+    border: 1px solid #15243c;
+    border-radius: 16px;
+}
+
+QLabel#railHeading {
+    color: #7d94b4;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 2px;
+}
+
+QLabel#runningBadge {
+    color: #4ade80;
+    font-size: 11px;
+    font-weight: 600;
+}
+
+QLabel#metricName {
+    color: #8fa8c4;
+    font-size: 11px;
+}
+
+QLabel#modeChip {
+    color: #c4b5fd;
+    background-color: rgba(76, 29, 149, 120);
+    border: 1px solid #7c3aed;
+    border-radius: 12px;
+    padding: 4px 14px;
+    font-size: 12px;
+    font-weight: 600;
+}
+
+QWidget#actionTile {
+    background-color: rgba(16, 26, 44, 235);
+    border: 1px solid #1a2c48;
+    border-radius: 14px;
+}
+
+QWidget#actionTile:hover {
+    border: 1px solid #2c5fc4;
+    background-color: rgba(23, 37, 63, 240);
+}
+
+QLabel#tileIcon {
+    color: #7dd3fc;
+    font-size: 17px;
+    background: transparent;
+}
+
+QLabel#tileLabel {
+    color: #c9d8ee;
+    font-size: 11px;
+    background: transparent;
+}
+
+QLabel#activityRow {
+    color: #c9d8ee;
+    font-size: 12px;
+    background: transparent;
+}
+
+QLabel#activityTime {
+    color: #54688a;
+    font-size: 10px;
+    background: transparent;
+}
+
+QLabel#statusBody {
+    color: #647d99;
+    font-size: 11px;
+}
+"""
+
+
+class _Card(QWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.setObjectName("railCard")
+
+
+class _ActionTile(QWidget):
+    """Mockup quick-action tile: emoji icon over a small label."""
+
+    def __init__(self, icon, label, on_click):
+        super().__init__()
+
+        self.setObjectName("actionTile")
+        self.setCursor(Qt.PointingHandCursor)
+        self.setFixedSize(76, 62)
+
+        self._on_click = on_click
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(4, 10, 4, 8)
+        layout.setSpacing(6)
+
+        icon_label = QLabel(icon)
+        icon_label.setObjectName("tileIcon")
+        icon_label.setAlignment(Qt.AlignCenter)
+
+        text_label = QLabel(label)
+        text_label.setObjectName("tileLabel")
+        text_label.setAlignment(Qt.AlignCenter)
+
+        layout.addWidget(icon_label)
+        layout.addWidget(text_label)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self._on_click:
+            self._on_click()
+
+        super().mousePressEvent(event)
+
+
+class SystemRail(QWidget):
+    """
+    Mockup rail: SYSTEM STATUS / CURRENT MODE / QUICK ACTIONS /
+    RECENT ACTIVITY cards in a single column.
+    """
+
+    def __init__(self, on_chip=None):
+        super().__init__()
+
+        self.on_chip = on_chip
+
+        self._activity_items = []
+        self._activity_rows = []
+        self._mode_chip_text = "Voice Listening"
+
+        self.setFixedWidth(280)
+        self.setStyleSheet(_STYLE)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        # ------------------------------------------------
+        # SYSTEM STATUS card: heading + Running + 4 gauges
+        # ------------------------------------------------
+        system_card = _Card()
+
+        system_layout = QVBoxLayout(system_card)
+        system_layout.setContentsMargins(16, 14, 16, 14)
+        system_layout.setSpacing(12)
+
+        heading_row = QHBoxLayout()
+
+        heading = QLabel("SYSTEM STATUS")
+        heading.setObjectName("railHeading")
+
+        self.running_dot = QLabel("â— Running")
+        self.running_dot.setObjectName("runningBadge")
+
+        heading_row.addWidget(heading)
+        heading_row.addStretch(1)
+        heading_row.addWidget(self.running_dot)
+
+        system_layout.addLayout(heading_row)
+
+        # Circular gauges row (4: CPU / RAM / Storage / Battery).
+        from ui.components.hud_widgets import RingGauge
+
+        gauges = QHBoxLayout()
+        gauges.setSpacing(4)
+
+        self.cpu = RingGauge("CPU")
+        self.ram = RingGauge("RAM")
+        self.disk = RingGauge("Storage")
+        self.battery = RingGauge("Battery")
+
+        for gauge in (self.cpu, self.ram, self.disk, self.battery):
+            gauges.addWidget(gauge, 1)
+
+        system_layout.addLayout(gauges)
+
+        layout.addWidget(system_card)
+
+        # ------------------------------------------------
+        # CURRENT MODE card: pill + waveform
+        # ------------------------------------------------
+        mode_card = _Card()
+
+        mode_layout = QVBoxLayout(mode_card)
+        mode_layout.setContentsMargins(16, 14, 16, 14)
+        mode_layout.setSpacing(10)
+
+        mode_heading_row = QHBoxLayout()
+
+        mode_heading = QLabel("CURRENT MODE")
+        mode_heading.setObjectName("railHeading")
+
+        self.mode_chip = QLabel("ðŸ”Š  Voice Listening")
+        self.mode_chip.setObjectName("modeChip")
+
+        mode_heading_row.addWidget(mode_heading)
+        mode_heading_row.addStretch(1)
+        mode_heading_row.addWidget(self.mode_chip)
+
+        # Living waveform: amplitude follows agent activity.
+        self.waveform = Waveform(bars=32)
+        self.waveform.setFixedHeight(64)
+
+        mode_layout.addLayout(mode_heading_row)
+        mode_layout.addWidget(self.waveform)
+
+        layout.addWidget(mode_card)
+
+        # ------------------------------------------------
+        # QUICK ACTIONS card: 3x2 icon tiles
+        # ------------------------------------------------
+        actions_card = _Card()
+
+        actions_layout = QVBoxLayout(actions_card)
+        actions_layout.setContentsMargins(16, 14, 16, 14)
+        actions_layout.setSpacing(8)
+
+        actions_heading_row = QHBoxLayout()
+
+        actions_heading = QLabel("QUICK ACTIONS")
+        actions_heading.setObjectName("railHeading")
+
+        actions_heading_row.addWidget(actions_heading)
+
+        actions_layout.addLayout(actions_heading_row)
+
+        actions_grid = QGridLayout()
+        actions_grid.setSpacing(8)
+
+        # Label -> the exact spoken command JARVIS understands.
+        quick_actions = [
+            ("ðŸ“¸", "Screenshot", "take a screenshot"),
+            ("âž•", "New Tab", "open a new tab"),
+            ("ðŸ”’", "Lock PC", "lock my laptop"),
+            ("ðŸ”Š", "Volume", "open volume control"),
+            ("â˜€ï¸", "Brightness", "open brightness settings"),
+            ("ðŸ“", "Take Note", "take a note"),
+        ]
+
+        for index, (icon, label, command) in enumerate(quick_actions):
+            tile = _ActionTile(
+                icon,
+                label,
+                on_click=(
+                    (lambda c=command: on_chip(c)) if on_chip else None
+                ),
+            )
+
+            actions_grid.addWidget(
+                tile,
+                index // 3,
+                index % 3,
+            )
+
+        actions_layout.addLayout(actions_grid)
+
+        layout.addWidget(actions_card)
+
+        # ------------------------------------------------
+        # RECENT ACTIVITY card: heading + "View all"
+        # ------------------------------------------------
+        activity_card = _Card()
+        activity_card.setMinimumHeight(200)
+
+        activity_layout = QVBoxLayout(activity_card)
+        activity_layout.setContentsMargins(16, 14, 16, 14)
+        activity_layout.setSpacing(8)
+
+        activity_heading_row = QHBoxLayout()
+
+        activity_heading = QLabel("RECENT ACTIVITY")
+        activity_heading.setObjectName("railHeading")
+
+        view_all = QLabel("View all")
+        view_all.setStyleSheet(
+            "color: #38bdf8; font-size: 11px; background: transparent;"
+        )
+
+        activity_heading_row.addWidget(activity_heading)
+        activity_heading_row.addStretch(1)
+        activity_heading_row.addWidget(view_all)
+
+        activity_layout.addLayout(activity_heading_row)
+
+        self.activity_layout = QVBoxLayout()
+        self.activity_layout.setSpacing(8)
+
+        self._activity_placeholder = QLabel("Nothing yet â€” talk to me.")
+        self._activity_placeholder.setObjectName("statusBody")
+        self._activity_placeholder.setWordWrap(True)
+
+        self.activity_layout.addWidget(self._activity_placeholder)
+
+        activity_layout.addLayout(self.activity_layout)
+        activity_layout.addStretch(1)
+
+        layout.addWidget(activity_card, 1)
+
+        # ------------------------------------------------
+        # Telemetry polling
+        # ------------------------------------------------
+        self._update_telemetry()
+
+        from PySide6.QtCore import QTimer
+
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._update_telemetry)
+        self._timer.start(2500)
+
+    # --------------------------------------------------
+    # MODE PILL (mockup: "Voice Listening", purple)
+    # --------------------------------------------------
+
+    _MODES = {
+        "IDLE": ("ðŸ”Š  Voice Listening", True),
+        "LISTENING": ("ðŸŽ™ï¸  Listening", False),
+        "THINKING": ("ðŸ§   Thinking", False),
+        "EXECUTING": ("âš™ï¸  Executing", False),
+        "WAITING_FOR_CONFIRMATION": ("ðŸ‘¤  Awaiting You", False),
+        "SHUTTING_DOWN": ("ðŸ’¤  Sleeping", False),
+    }
+
+    def set_mode(self, state: str):
+        text, _dim = self._MODES.get(
+            state,
+            (f"âš™ï¸  {state.title()}", False),
+        )
+
+        self._mode_chip_text = text
+
+        self.mode_chip.setText(text)
+
+    # --------------------------------------------------
+    # AGENT STATUS LINE (kept for state sweep compatibility)
+    # --------------------------------------------------
+
+    def set_agent_status(self, title: str, body: str):
+        # The mockup shows the mode as the pill (set_mode) â€” no
+        # separate agent card. Kept as a no-op-compatible hook.
+        pass
+
+    # --------------------------------------------------
+    # RECENT ACTIVITY FEED (icon rows + relative times)
+    # --------------------------------------------------
+
+    _ACTIVITY_ICONS = [
+        ("chrome", "ðŸŒ"),
+        ("vs code", "ðŸ§©"),
+        ("vscode", "ðŸ§©"),
+        ("code", "ðŸ§©"),
+        ("search", "ðŸ”"),
+        ("youtube", "â–¶ï¸"),
+        ("download", "ðŸ“"),
+        ("file", "ðŸ“"),
+        ("folder", "ðŸ“"),
+        ("remind", "â°"),
+        ("note", "ðŸ“"),
+        ("volume", "ðŸ”Š"),
+        ("brightness", "â˜€ï¸"),
+        ("whatsapp", "ðŸ’¬"),
+        ("instagram", "ðŸ“·"),
+        ("spotify", "ðŸŽ§"),
+        ("lock", "ðŸ”’"),
+        ("screenshot", "ðŸ“¸"),
+    ]
+
+    def _icon_for(self, text: str) -> str:
+        lowered = text.lower()
+
+        for needle, icon in self._ACTIVITY_ICONS:
+            if needle in lowered:
+                return icon
+
+        return "ðŸ”¹"
+
+    def add_activity(self, text: str):
+        """Prepend a compact activity row (max 4 visible)."""
+
+        from datetime import datetime
+
+        # The placeholder QLabel can be C++-deleted once removed by
+        # deleteLater; guard so a late call can never raise.
+        if self._activity_placeholder is not None:
+            try:
+                self._activity_placeholder.hide()
+
+            except RuntimeError:
+                pass
+
+            self._activity_placeholder = None
+
+        from PySide6.QtWidgets import QHBoxLayout
+
+        icon = self._icon_for(text)
+
+        row_label = QLabel(f"{icon}  {text}")
+        row_label.setObjectName("activityRow")
+
+        time_label = QLabel(
+            datetime.now().strftime("%H:%M")
+        )
+        time_label.setObjectName("activityTime")
+
+        line = QHBoxLayout()
+        line.setSpacing(8)
+        line.addWidget(row_label, 1)
+        line.addWidget(time_label)
+
+        self.activity_layout.insertLayout(0, line)
+        self._activity_rows.append(line)
+
+        # Keep at most 4 rows (rows are nested layouts).
+        while len(self._activity_rows) > 4:
+            old = self._activity_rows.pop(0)
+
+            while old.count():
+                child = old.takeAt(0)
+
+                child_widget = child.widget()
+
+                if child_widget is not None:
+                    child_widget.deleteLater()
+
+    def note_command(self):
+        """One more command counted this session (reserved)."""
+
+        pass
+
+    # --------------------------------------------------
+    # TELEMETRY
+    # --------------------------------------------------
+
+    def _update_telemetry(self):
+        try:
+            self.cpu.set_value(int(psutil.cpu_percent(interval=None)))
+
+            ram = psutil.virtual_memory()
+
+            self.ram.set_value(int(ram.percent))
+
+            try:
+                battery = psutil.sensors_battery()
+
+                if battery is not None:
+                    percent = int(battery.percent)
+
+                    if battery.power_plugged:
+                        self.battery.set_value(
+                            percent,
+                            f"âš¡ {percent}%",
+                        )
+
+                    else:
+                        self.battery.set_value(percent)
+
+                else:
+                    self.battery.set_value(0, "n/a")
+
+            except Exception:
+                self.battery.set_value(0, "n/a")
+
+            # Disk usage (root partition).
+            disk = psutil.disk_usage("C:\\")
+
+            self.disk.set_value(int(disk.percent))
+
+        except Exception:
+            pass
+
+    # --------------------------------------------------
+    # STATE VISUALS (waveform color/energy)
+    # --------------------------------------------------
+
+    def set_state_visuals(self, color_hex: str, activity: float):
+        self.waveform.set_color(color_hex)
+        self.waveform.set_level(activity)
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\title_bar.py =====
+
+"""
+Frameless title bar for the JARVIS window, mockup-exact:
+
+orb brand + "JARVIS / DESKTOP AGENT" wordmark on the left, the
+time-aware greeting centered, and a clock card plus notification,
+minimize, maximize and close controls on the right. Handles window
+dragging and double-click maximize.
+"""
+
+from datetime import datetime
+
+from PySide6.QtCore import Qt, QPoint, QTimer
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
+
+
+_STYLE = """
+QWidget#titleBar {
+    background-color: rgba(8, 13, 24, 150);
+    border-bottom: 1px solid #101c30;
+}
+
+QLabel#brand {
+    color: #dbeafe;
+    font-size: 19px;
+    font-weight: 600;
+    letter-spacing: 9px;
+}
+
+QLabel#brandSub {
+    color: #3f5673;
+    font-size: 8px;
+    letter-spacing: 4px;
+    padding-top: 3px;
+}
+
+QLabel#greeting {
+    color: #d7e6fb;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+QLabel#tagline {
+    color: #54688a;
+    font-size: 10px;
+    font-style: italic;
+    padding-top: 2px;
+}
+
+QWidget#clockCard {
+    background-color: rgba(12, 20, 34, 235);
+    border: 1px solid #16263c;
+    border-radius: 12px;
+}
+
+QLabel#clockTime {
+    color: #eaf2ff;
+    font-size: 19px;
+    font-weight: 700;
+}
+
+QLabel#clockDate {
+    color: #54688a;
+    font-size: 9px;
+}
+
+QPushButton#winButton {
+    color: #6b80a0;
+    background: transparent;
+    border: none;
+    font-size: 13px;
+    padding: 5px 11px;
+}
+
+QPushButton#winButton:hover {
+    color: #e6eefb;
+    background-color: #142131;
+    border-radius: 8px;
+}
+
+QPushButton#closeButton {
+    color: #6b80a0;
+    background: transparent;
+    border: none;
+    font-size: 13px;
+    padding: 5px 11px;
+}
+
+QPushButton#closeButton:hover {
+    color: #fecaca;
+    background-color: #7f1d1d;
+    border-radius: 8px;
+}
+"""
+
+
+class TitleBar(QWidget):
+    def __init__(self, window):
+        super().__init__(window)
+
+        self.window_ref = window
+
+        self.setObjectName("titleBar")
+        self.setStyleSheet(_STYLE)
+        self.setFixedHeight(74)
+
+        self._drag_position = None
+        self._maximized = False
+
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(18, 8, 10, 8)
+        layout.setSpacing(10)
+
+        # ------------------------------------------------
+        # BRAND: glowing orb + JARVIS wordmark
+        # ------------------------------------------------
+        self.dot = QLabel()
+        self.dot.setFixedSize(38, 38)
+        self.dot.setAlignment(Qt.AlignCenter)
+        self.dot.setStyleSheet(
+            "border-radius: 19px;"
+            "background-color: qradialgradient(cx:0.5 cy:0.42, radius:0.55, "
+            "stop:0 #e0f7ff, stop:0.35 #38bdf8, stop:0.75 #1d4ed8, stop:1 #0b1f3d);"
+            "border: 2px solid #2563eb;"
+        )
+
+        brand_column = QVBoxLayout()
+        brand_column.setSpacing(0)
+
+        brand = QLabel("J A R V I S")
+        brand.setObjectName("brand")
+
+        subtitle = QLabel("DESKTOP AGENT")
+        subtitle.setObjectName("brandSub")
+
+        brand_column.addWidget(brand)
+        brand_column.addWidget(subtitle)
+
+        layout.addWidget(self.dot)
+        layout.addSpacing(6)
+        layout.addLayout(brand_column)
+
+        layout.addStretch(1)
+
+        # ------------------------------------------------
+        # CENTER: time-aware greeting + tagline
+        # ------------------------------------------------
+        center_column = QVBoxLayout()
+        center_column.setSpacing(0)
+
+        greeting_row = QHBoxLayout()
+        greeting_row.setAlignment(Qt.AlignCenter)
+        greeting_row.setSpacing(8)
+
+        moon = QLabel("ðŸŒ™")
+        moon.setStyleSheet("font-size: 14px; background: transparent;")
+
+        self.greeting = QLabel("")
+        self.greeting.setObjectName("greeting")
+
+        greeting_row.addWidget(moon)
+        greeting_row.addWidget(self.greeting)
+
+        self.tagline = QLabel("")
+        self.tagline.setObjectName("tagline")
+        self.tagline.setAlignment(Qt.AlignCenter)
+
+        center_column.addLayout(greeting_row)
+        center_column.addWidget(self.tagline)
+
+        layout.addLayout(center_column)
+
+        layout.addStretch(1)
+
+        # ------------------------------------------------
+        # CLOCK CARD
+        # ------------------------------------------------
+        clock_card = QWidget()
+        clock_card.setObjectName("clockCard")
+
+        clock_layout = QVBoxLayout(clock_card)
+        clock_layout.setContentsMargins(16, 6, 16, 6)
+        clock_layout.setSpacing(0)
+
+        self.clock = QLabel()
+        self.clock.setObjectName("clockTime")
+        self.clock.setAlignment(Qt.AlignCenter)
+
+        self.date_label = QLabel()
+        self.date_label.setObjectName("clockDate")
+        self.date_label.setAlignment(Qt.AlignCenter)
+
+        clock_layout.addWidget(self.clock)
+        clock_layout.addWidget(self.date_label)
+
+        self._update_clock()
+
+        clock_timer = QTimer(self)
+        clock_timer.timeout.connect(self._update_clock)
+        clock_timer.start(10_000)
+
+        layout.addWidget(clock_card)
+        layout.addSpacing(6)
+
+        # ------------------------------------------------
+        # NOTIFICATION + WINDOW CONTROLS
+        # ------------------------------------------------
+        bell = QPushButton("ðŸ””")
+        bell.setObjectName("winButton")
+        bell.setCursor(Qt.PointingHandCursor)
+        bell.setToolTip("Notifications")
+        bell.clicked.connect(self._notify)
+
+        minimize = QPushButton("â”€")
+        minimize.setObjectName("winButton")
+        minimize.setCursor(Qt.PointingHandCursor)
+        minimize.clicked.connect(self.window_ref.showMinimized)
+
+        self.maximize = QPushButton("â˜")
+        self.maximize.setObjectName("winButton")
+        self.maximize.setCursor(Qt.PointingHandCursor)
+        self.maximize.clicked.connect(self._toggle_maximize)
+
+        close = QPushButton("âœ•")
+        close.setObjectName("closeButton")
+        close.setCursor(Qt.PointingHandCursor)
+        close.clicked.connect(self.window_ref.close)
+
+        layout.addWidget(bell)
+        layout.addWidget(minimize)
+        layout.addWidget(self.maximize)
+        layout.addWidget(close)
+
+    def _update_clock(self):
+        now = datetime.now()
+
+        self.clock.setText(now.strftime("%H:%M"))
+        self.date_label.setText(now.strftime("%a, %d %b %Y"))
+
+    def _notify(self):
+        self.window_ref.tray.showMessage(
+            "All systems nominal",
+            "No new notifications, sir.",
+            self.window_ref.tray.Information,
+            2500,
+        )
+
+    def _toggle_maximize(self):
+        if self.window_ref.isMaximized():
+            self.window_ref.showNormal()
+        else:
+            self.window_ref.showMaximized()
+
+    def set_greeting(self, text: str, tagline: str = ""):
+        self.greeting.setText(text)
+        self.tagline.setText(tagline)
+
+    # --------------------------------------------------
+    # STATUS (state ring on the brand orb; full mode is
+    # shown in the CURRENT MODE card of the rail)
+    # --------------------------------------------------
+
+    def set_status(self, text: str, color: str):
+        self.dot.setStyleSheet(
+            "border-radius: 19px;"
+            "background-color: qradialgradient(cx:0.5 cy:0.42, radius:0.55, "
+            "stop:0 #e0f7ff, stop:0.35 #38bdf8, stop:0.75 #1d4ed8, stop:1 #0b1f3d);"
+            f"border: 2px solid {color};"
+        )
+
+    # --------------------------------------------------
+    # DRAGGING + DOUBLE-CLICK MAXIMIZE
+    # --------------------------------------------------
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self._drag_position = (
+                event.globalPosition().toPoint()
+                - self.window_ref.frameGeometry().topLeft()
+            )
+
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (
+            self._drag_position is not None
+            and event.buttons() & Qt.LeftButton
+        ):
+            self.window_ref.move(
+                event.globalPosition().toPoint()
+                - self._drag_position
+            )
+
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._drag_position = None
+
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        self._toggle_maximize()
+
+        super().mouseDoubleClickEvent(event)
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\components\wake_overlay.py =====
+
+"""
+Siri-like circular wake animation overlay for JARVIS.
+
+A frameless, always-on-top overlay window positioned bottom-center of
+the screen. When JARVIS is awake, a layered glowing orb with orbiting
+arcs animates; color reflects the agent state (listening green,
+thinking amber, executing pink, confirmation orange, error red).
+"""
+
+from math import sin, cos, pi
+
+from PySide6.QtCore import Qt, QTimer, QPoint
+from PySide6.QtGui import (
+    QColor,
+    QPainter,
+    QPen,
+    QBrush,
+    QRadialGradient,
+    QPainterPath,
+)
+from PySide6.QtWidgets import QWidget, QApplication
+
+
+class WakeOverlay(QWidget):
+    """Bottom-center circular assistant animation."""
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool,
+        )
+
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+
+        # Compact size: visible but never intrusive.
+        screen = QApplication.primaryScreen().availableGeometry()
+
+        self._diameter = min(150, screen.height() // 6)
+
+        self.setFixedSize(self._diameter, self._diameter)
+
+        # Bottom-center of the screen with a small margin.
+        margin = 24
+
+        self.move(
+            (screen.width() - self._diameter) // 2,
+            screen.height() - self._diameter - margin,
+        )
+
+        self.phase = 0.0
+        self.visible_phase = 0.0
+
+        self.base_color = QColor("#4ade80")
+        self.current_color = QColor("#4ade80")
+
+        self._active = False
+        self._target_opacity = 0.0
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self._tick)
+        self.timer.start(30)
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def wake(self, color: str = "#4ade80"):
+        """Show the orb with the given state color."""
+
+        self.base_color = QColor(color)
+        self.current_color = QColor(color)
+        self._active = True
+        self._target_opacity = 1.0
+        self.show()
+
+    def sleep(self):
+        """Fade out and hide the orb."""
+
+        self._active = False
+        self._target_opacity = 0.0
+
+    # ==================================================
+    # ANIMATION
+    # ==================================================
+
+    def _tick(self):
+        self.phase = (self.phase + 0.06) % (2 * pi)
+
+        # Smooth opacity transitions toward the target.
+        self.visible_phase += (
+            self._target_opacity - self.visible_phase
+        ) * 0.12
+
+        if self.visible_phase < 0.02 and not self._active:
+            if self.isVisible():
+                self.hide()
+
+            return
+
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, event):
+        if self.visible_phase <= 0.01:
+            return
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+
+        painter.setOpacity(self.visible_phase)
+
+        size = min(self.width(), self.height())
+        center = QPoint(self.width() // 2, self.height() // 2)
+        cx, cy = center.x(), center.y()
+
+        color = self.current_color
+
+        breathe = (sin(self.phase * 1.7) + 1) / 2
+
+        # ------------------------------------------------
+        # Layer 1: soft radial glow
+        # ------------------------------------------------
+        glow_radius = size * (0.34 + 0.03 * breathe)
+
+        gradient = QRadialGradient(cx, cy, glow_radius)
+
+        glow_color = QColor(color)
+        glow_color.setAlpha(70 + int(40 * breathe))
+
+        gradient.setColorAt(0.0, glow_color)
+        gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(gradient))
+
+        painter.drawEllipse(
+            QPoint(cx, cy),
+            int(glow_radius),
+            int(glow_radius),
+        )
+
+        # ------------------------------------------------
+        # Layer 2: core orb with brighter center
+        # ------------------------------------------------
+        core_radius = size * (0.16 + 0.015 * breathe)
+
+        core_gradient = QRadialGradient(cx, cy, core_radius)
+
+        inner = QColor("white")
+        inner.setAlpha(220)
+
+        core_gradient.setColorAt(0.0, inner)
+        core_gradient.setColorAt(0.55, color)
+        core_gradient.setColorAt(1.0, QColor(0, 0, 0, 0))
+
+        painter.setBrush(QBrush(core_gradient))
+
+        painter.drawEllipse(
+            QPoint(cx, cy),
+            int(core_radius),
+            int(core_radius),
+        )
+
+        # ------------------------------------------------
+        # Layer 3: orbiting arcs (Siri-like motion)
+        # ------------------------------------------------
+        for index in range(3):
+            orbit_radius = size * (0.22 + 0.06 * index)
+
+            pen_width = 4 - index
+
+            arc_color = QColor(color)
+            arc_color.setAlpha(160 - 40 * index)
+
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(arc_color, pen_width))
+
+            start = (
+                self.phase * (60 + 40 * index)
+                + index * 2.1
+            )
+
+            span = 70 + 25 * sin(self.phase * (1.3 + 0.4 * index))
+
+            from PySide6.QtCore import QRect
+
+            rect = QRect(
+                int(cx - orbit_radius),
+                int(cy - orbit_radius),
+                int(orbit_radius * 2),
+                int(orbit_radius * 2),
+            )
+
+            painter.drawArc(rect, int(start * 16), int(span * 16))
+
+        # ------------------------------------------------
+        # Layer 4: faint outer shimmer ring
+        # ------------------------------------------------
+        shimmer = size * (0.42 + 0.015 * breathe)
+
+        ring_color = QColor(color)
+        ring_color.setAlpha(50)
+
+        painter.setPen(QPen(ring_color, 2))
+        painter.setBrush(Qt.NoBrush)
+
+        painter.drawEllipse(
+            QPoint(cx, cy),
+            int(shimmer),
+            int(shimmer),
+        )
+
+
+def get_overlay():
+    """Return the shared overlay instance (creates on first call)."""
+
+    global _overlay
+
+    try:
+        return _overlay
+    except NameError:
+        _overlay = WakeOverlay()
+        return _overlay
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\ui\__init__.py =====
+

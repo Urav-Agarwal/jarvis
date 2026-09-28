@@ -1,3 +1,659 @@
+﻿
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\context.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\conversation.py =====
+
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\intent_engine.py =====
+
+import json
+from tools.capabilities import CapabilityRegistry
+from tools.browsers import BrowserManager
+
+class IntentEngine:
+    def __init__(self, ai_provider):
+        self.ai = ai_provider
+        self.capabilities = CapabilityRegistry()
+        self.browsers = BrowserManager()
+
+    def parse(self, user_input: str):
+        capabilities = self.capabilities.all()
+
+        capability_text = "\n".join(
+            f"- {name}: {data['description']}"
+            for name, data in capabilities.items()
+        )
+
+        prompt = f"""
+    You are the intent engine for JARVIS, a Windows desktop voice assistant.
+
+    Your job is to understand what the user wants and determine whether
+    their request matches one of JARVIS's available capabilities.
+
+    AVAILABLE CAPABILITIES:
+
+    {capability_text}
+
+    IMPORTANT RULES:
+
+    1. Understand natural language.
+    2. Different words and phrases can mean the same thing.
+    3. Do not require the user to use the exact capability name.
+    4. If the user's request clearly matches a capability, return that capability.
+    5. If the request does not match any available capability, return "unknown".
+    6. Never invent a capability that is not listed above.
+    7. Return ONLY valid JSON.
+    8. Do not use Markdown.
+    9. Do not explain your answer.
+
+    For open_application:
+
+    - Extract the name of the application the user wants to open.
+    - Preserve the application name as naturally as possible.
+    - Return it using the "application" field.
+
+    For open_browser:
+
+    - Extract the name of the browser the user wants to open.
+    - Return it using the "browser" field.
+    - If the user does not specify a profile, do not include a profile field.
+
+    For open_browser_profile:
+
+    - Extract the name of the browser.
+    - Extract the requested profile or profile alias.
+    - Return the browser using the "browser" field.
+    - Return the requested profile using the "profile" field.
+    - The profile may be an actual discovered profile name such as "School" or "malti".
+    - It may also be an alias such as "personal", "default", "main", or "my profile".
+    - Do not invent profile names.
+
+    Examples:
+
+    {{"intent": "open_browser", "browser": "Google Chrome"}}
+
+    {{"intent": "open_browser_profile", "browser": "Google Chrome", "profile": "School"}}
+
+    {{"intent": "open_browser_profile", "browser": "Chrome", "profile": "personal"}}
+
+    {{"intent": "open_browser_profile", "browser": "Comet", "profile": "School account"}}
+
+    Example:
+
+    {{"intent": "open_application", "application": "Google Chrome"}}
+
+    For capabilities that require an amount or percentage:
+
+    - volume_up:
+    Extract the requested percentage.
+    If no amount is given, use 10.
+
+    - volume_down:
+    Extract the requested percentage.
+    If no amount is given, use 10.
+
+    - set_volume:
+    Extract the requested percentage.
+    "maximum", "max", or "full" means 100.
+    "minimum", "min", "zero", or "silent" means 0.
+
+    JSON examples:
+
+    {{"intent": "lock_laptop"}}
+
+    {{"intent": "volume_up", "amount": 20}}
+
+    {{"intent": "volume_down", "amount": 10}}
+
+    {{"intent": "set_volume", "amount": 50}}
+
+    {{"intent": "volume_mute"}}
+
+    {{"intent": "volume_unmute"}}
+
+    {{"intent": "unknown"}}
+
+    {{"intent": "open_browser", "browser": "Google Chrome"}}
+    {{"intent": "open_browser_profile", "browser": "Google Chrome", "profile": "School"}}
+    {{"intent": "open_browser_profile", "browser": "Google Chrome", "profile": "personal"}}
+
+    User request:
+    {user_input}
+    """
+
+        response = self.ai.generate(prompt)
+
+        try:
+            result = json.loads(response)
+        except json.JSONDecodeError:
+            return {"intent": "unknown"}
+
+        intent = result.get("intent")
+
+        if intent != "unknown" and not self.capabilities.exists(intent):
+            return {"intent": "unknown"}
+
+        return result
+    
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\intent_parser.py =====
+
+import re
+
+
+class IntentParser:
+    def parse(self, user_input: str):
+        text = user_input.lower().strip()
+
+        # Remove punctuation.
+        text = re.sub(r"[^\w\s%]", " ", text)
+
+        # Normalize whitespace.
+        text = re.sub(r"\s+", " ", text).strip()
+
+        # -------------------------
+        # LOCK LAPTOP
+        # -------------------------
+
+        if self._matches_action(
+            text,
+            action_words=("lock",),
+            target_words=("laptop", "computer", "pc", "screen"),
+        ):
+            return "lock_laptop"
+
+        # -------------------------
+        # SLEEP LAPTOP
+        # -------------------------
+
+        if self._matches_action(
+            text,
+            action_words=("sleep", "suspend"),
+            target_words=("laptop", "computer", "pc"),
+        ):
+            return "sleep_laptop"
+
+        # -------------------------
+        # RESTART LAPTOP
+        # -------------------------
+
+        if self._matches_action(
+            text,
+            action_words=("restart", "reboot"),
+            target_words=("laptop", "computer", "pc"),
+        ):
+            return "restart_laptop"
+
+        # -------------------------
+        # SHUTDOWN LAPTOP
+        # -------------------------
+
+        if self._matches_action(
+            text,
+            action_words=("shutdown", "shut down", "power off"),
+            target_words=("laptop", "computer", "pc"),
+        ):
+            return "shutdown_laptop"
+
+        # -------------------------
+        # SET VOLUME
+        # -------------------------
+
+        volume_match = re.search(
+            r"\b(?:set|change|make|put)\b.*?\bvolume\b.*?(\d{1,3})\s*(?:percent|%)?",
+            text,
+        )
+
+        if volume_match:
+            percentage = int(volume_match.group(1))
+
+            if 0 <= percentage <= 100:
+                return ("set_volume", percentage)
+
+        # -------------------------
+        # MAXIMUM VOLUME
+        # -------------------------
+
+        if re.search(
+            r"\b(set|put|make|turn)\b.*\bvolume\b.*\b(maximum|max|full)\b",
+            text,
+        ):
+            return ("set_volume", 100)
+
+        # -------------------------
+        # ZERO VOLUME
+        # -------------------------
+
+        if re.search(
+            r"\b(set|put|make|turn)\b.*\bvolume\b.*\b(minimum|min|zero|silent)\b",
+            text,
+        ):
+            return ("set_volume", 0)
+
+        # -------------------------
+        # MUTE
+        # -------------------------
+
+        if self._matches_any(
+            text,
+            (
+                r"\bmute\b",
+                r"\bmake it silent\b",
+                r"\bsilence\b.*\b(volume|sound|audio)?\b",
+            ),
+        ):
+            return "volume_mute"
+
+        # -------------------------
+        # UNMUTE
+        # -------------------------
+
+        if self._matches_any(
+            text,
+            (
+                r"\bunmute\b",
+                r"\bturn the sound back on\b",
+                r"\brestore the sound\b",
+            ),
+        ):
+            return "volume_unmute"
+
+        # -------------------------
+        # VOLUME UP WITH AMOUNT
+        # -------------------------
+
+        volume_up_match = re.search(
+            r"\b(increase|raise|boost)\b.*?(\d{1,3})\s*(?:percent|%)?",
+            text,
+        )
+
+        if volume_up_match:
+            amount = int(volume_up_match.group(2))
+
+            if 0 <= amount <= 100:
+                return ("volume_up", amount)
+
+        volume_up_match = re.search(
+            r"\b(increase|raise|boost)\b.*?(\d{1,3})\s*(?:percent|%)?",
+            text,
+        )
+
+        if volume_up_match:
+            amount = int(volume_up_match.group(1))
+
+            if 0 <= amount <= 100:
+                return ("volume_up", amount)
+
+
+        # -------------------------
+        # NORMAL VOLUME UP
+        # -------------------------
+
+        if self._matches_any(
+            text,
+            (
+                r"\b(increase|raise|boost)\b.*\bvolume\b",
+                r"\bvolume\b.*\b(up|higher|louder)\b",
+                r"\b(make it louder)\b",
+            ),
+        ):
+            return ("volume_up", 10)
+
+        # -------------------------
+        # VOLUME DOWN WITH AMOUNT
+        # -------------------------
+
+        volume_down_match = re.search(
+            r"\b(decrease|lower|reduce)\b.*?(\d{1,3})\s*(?:percent|%)?",
+            text,
+        )
+
+        if volume_down_match:
+            amount = int(volume_down_match.group(2))
+
+            if 0 <= amount <= 100:
+                return ("volume_down", amount)
+
+        volume_down_match = re.search(
+            r"\bturn\b.*?\bvolume\b.*?\bdown\b.*?(\d{1,3})\s*(?:percent|%)",
+            text,
+        )
+
+        if volume_down_match:
+            amount = int(volume_down_match.group(1))
+
+            if 0 <= amount <= 100:
+                return ("volume_down", amount)
+
+        # -------------------------
+        # NORMAL VOLUME DOWN
+        # -------------------------
+
+        if self._matches_any(
+            text,
+            (
+                r"\b(decrease|lower|turn down|reduce)\b.*\bvolume\b",
+                r"\bvolume\b.*\b(down|lower|quieter)\b",
+                r"\b(make it quieter)\b",
+            ),
+        ):
+            return ("volume_down", 10)
+
+        return None
+
+    def _matches_any(self, text, patterns):
+        for pattern in patterns:
+            if re.search(pattern, text):
+                return True
+
+        return False
+
+    def _matches_action(self, text, action_words, target_words):
+        action_pattern = "|".join(
+            re.escape(word) for word in action_words
+        )
+
+        target_pattern = "|".join(
+            re.escape(word) for word in target_words
+        )
+
+        return (
+            re.search(
+                rf"\b({action_pattern})\b.*\b({target_pattern})\b",
+                text,
+            )
+            or re.search(
+                rf"\b({target_pattern})\b.*\b({action_pattern})\b",
+                text,
+            )
+        )
+
+
+if __name__ == "__main__":
+    parser = IntentParser()
+
+    test_commands = [
+        "Increase the volume",
+        "Increase the volume by 30%",
+        "Turn the volume up by 20 percent",
+        "Make it louder",
+
+        "Decrease the volume",
+        "Decrease the volume by 15%",
+        "Turn the volume down by 25 percent",
+        "Make it quieter",
+
+        "Mute",
+        "Mute the volume",
+        "Make it silent",
+
+        "Lock my screen",
+        "Please lock my screen",
+        "Can you lock the screen",
+
+        "Unmute",
+        "Unmute the volume",
+
+        "Decrease the volume by 20",
+        "Increase the volume by 30",
+
+        "Set the volume to 50 percent",
+        "Set the volume to maximum",
+        "Set the volume to max",
+        "Put the volume at 30 percent",
+        "Set the volume to zero",
+    ]
+
+    for command in test_commands:
+        print(command, "->", parser.parse(command))
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\memory.py =====
+
+"""
+Persistent memory for JARVIS.
+
+Stores durable user facts ("remember that I prefer dark mode") as a
+JSON file in data/. Deliberately deterministic â€” no LLM in the loop.
+"""
+
+import json
+import os
+import re
+import threading
+import time
+from pathlib import Path
+
+
+class MemoryStore:
+    """JSON-file-backed persistent memory with keyword search."""
+
+    def __init__(self, path=None):
+        self.path = Path(path or os.path.join("data", "memory.json"))
+
+        self._lock = threading.Lock()
+
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+
+        self._entries = []
+
+        self._load()
+
+    # ==================================================
+    # PUBLIC API
+    # ==================================================
+
+    def remember(self, information: str) -> dict:
+        """Store a new durable fact (updates in place if restated)."""
+
+        if not isinstance(information, str) or not information.strip():
+            return {
+                "success": False,
+                "error": "Nothing to remember.",
+            }
+
+        # Strip conversational prefixes ("remember that ...").
+        information = re.sub(
+            r"^remember(?: that| this)?[,: ]+",
+            "",
+            information.strip(),
+            flags=re.IGNORECASE,
+        )
+
+        with self._lock:
+            existing = self._find_exact(information)
+
+            if existing is not None:
+                existing["updated_at"] = time.time()
+                self._save()
+
+                return {
+                    "success": True,
+                    "updated": True,
+                    "information": information,
+                    "message": "I already had that stored.",
+                }
+
+            self._entries.append(
+                {
+                    "information": information,
+                    "created_at": time.time(),
+                }
+            )
+
+            self._save()
+
+        return {
+            "success": True,
+            "updated": False,
+            "information": information,
+            "message": f"Remembered: {information}",
+        }
+
+    def recall(self, query: str) -> dict:
+        """Search stored facts by keyword overlap."""
+
+        query = (query or "").strip()
+
+        with self._lock:
+            matches = self._search(query)
+
+        if not matches:
+            # Keyword search found nothing: fall back to the most
+            # recent facts so conversational recall still works.
+            if self._entries:
+                recent = [
+                    entry["information"]
+                    for entry in self._entries[-3:]
+                ]
+
+                return {
+                    "success": True,
+                    "results": recent,
+                    "message": "Here is what I remember: "
+                    + "; ".join(recent),
+                }
+
+            return {
+                "success": True,
+                "results": [],
+                "message": "I don't have anything stored yet.",
+            }
+
+        informations = [entry["information"] for entry in matches]
+
+        return {
+            "success": True,
+            "results": informations,
+            "message": "; ".join(informations),
+        }
+
+    def update(self, query: str, information: str) -> dict:
+        """Update the best-matching stored fact, or store anew."""
+
+        if not isinstance(information, str) or not information.strip():
+            return {
+                "success": False,
+                "error": "Nothing to update with.",
+            }
+
+        with self._lock:
+            matches = self._search(query)
+
+        if not matches:
+            return self.remember(information)
+
+        best = matches[0]
+        best["information"] = information.strip()
+        best["updated_at"] = time.time()
+
+        with self._lock:
+            self._save()
+
+        return {
+            "success": True,
+            "updated": True,
+            "information": best["information"],
+            "message": f"Updated: {best['information']}",
+        }
+
+    def forget(self, query: str) -> dict:
+        """Remove the best-matching stored fact."""
+
+        with self._lock:
+            matches = self._search(query)
+
+        if not matches:
+            return {
+                "success": False,
+                "error": "I don't have anything stored about that.",
+            }
+
+        best = matches[0]
+
+        with self._lock:
+            self._entries.remove(best)
+            self._save()
+
+        return {
+            "success": True,
+            "information": best["information"],
+            "message": f"Forgotten: {best['information']}",
+        }
+
+    def all_facts(self) -> list:
+        with self._lock:
+            return [dict(entry) for entry in self._entries]
+
+    # ==================================================
+    # INTERNALS
+    # ==================================================
+
+    def _find_exact(self, information: str):
+        normalized = information.lower().strip()
+
+        for entry in self._entries:
+            if entry["information"].lower().strip() == normalized:
+                return entry
+
+        return None
+
+    def _search(self, query: str) -> list:
+        keywords = self._keywords(query)
+
+        if not keywords:
+            return []
+
+        scored = []
+
+        for entry in self._entries:
+            text = entry["information"].lower()
+            score = sum(1 for keyword in keywords if keyword in text)
+
+            if score > 0:
+                scored.append((score, entry))
+
+        scored.sort(key=lambda pair: pair[0], reverse=True)
+
+        return [entry for _, entry in scored]
+
+    @staticmethod
+    def _keywords(query: str) -> list:
+        words = re.findall(r"[a-z0-9]+", query.lower())
+
+        stopwords = {
+            "what", "do", "you", "about", "my", "me", "the", "a",
+            "an", "is", "are", "that", "this", "it", "i", "am",
+            "remember", "recall", "forget", "tell", "of", "on",
+        }
+
+        return [word for word in words if word not in stopwords]
+
+    def _load(self):
+        if not self.path.exists():
+            return
+
+        try:
+            with open(self.path, "r", encoding="utf-8") as file:
+                data = json.load(file)
+
+            if isinstance(data, list):
+                self._entries = data
+
+        except (json.JSONDecodeError, OSError):
+            # Corrupt memory file: start empty rather than crash.
+            self._entries = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as file:
+                json.dump(self._entries, file, indent=2)
+
+        except OSError:
+            pass
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\orchestrator.py =====
+
 import os
 import re
 import subprocess
@@ -50,35 +706,10 @@ class Orchestrator:
             interrupt_check=lambda: self.interrupt_requested,
         )
 
-        # KILL SWITCH (v4): one switch halts speech, mouse motion,
-        # LLM calls, plans and confirmations. Wired into the mouse
-        # controller and the provider; callbacks cut speech and
-        # clear pending state. Global hotkey Ctrl+Alt+Shift+J.
-        from security.kill_switch import get_kill_switch
-
-        self.kill_switch = get_kill_switch()
-
-        self.kill_switch.on_trigger(self._on_kill_switch)
-
-        self.kill_switch.install_hotkey()
-
-        try:
-            from tools.computer_controller import ComputerController
-
-            ComputerController.abort_event = self.kill_switch.abort_event
-
-        except Exception:
-            pass
-
-        self.ai.abort_events = [self.kill_switch.abort_event]
-
         # Give the runtime and the brain direct access to the same
         # abort event (checked inside provider.generate).
         self.agent.abort_event = self.thinking_abort
         self.agent.brain.abort_event = self.thinking_abort
-
-        # v4.1 latency: let the runtime find the exchange trace.
-        self.agent._orchestrator_ref = self
         self.microphone = Microphone()
         self.speech_to_text = SpeechToText()
         self.text_to_speech = TextToSpeech()
@@ -123,99 +754,9 @@ class Orchestrator:
         # may trigger again (tuned past the tail of spoken replies).
         self.wake_cooldown = 2.2
 
-        # ------------------------------------------------------
-        # v4 SESSION: the conversation does NOT end with a task.
-        # DORMANT -> ACTIVE -> (LISTENING | THINKING | ACTING |
-        # SPEAKING) -> ACTIVE ... -> DORMANT. Sleep happens ONLY on
-        # an explicit dismissal or the idle timeout (5 min default,
-        # settings.yaml: session.idle_timeout_seconds) — never on an
-        # exchange count, never after 6 s of silence, never while a
-        # confirmation/draft/task is pending.
-        # ------------------------------------------------------
-        from assistant.session import ConversationSession
-
-        def _busy():
-            return (
-                self.agent.confirmations.has_pending()
-                or getattr(self.agent, "_pending_send", None) is not None
-                or getattr(self.agent, "_pending_draft", None) is not None
-                or getattr(self.agent, "_teaching_pending_save", None)
-                is not None
-                or getattr(self.agent, "_recorder_pending_save", None)
-                is not None
-                or self.speaking
-            )
-
-        idle_timeout = 300.0
-
-        try:
-            from app.config import get as get_setting
-
-            idle_timeout = float(
-                get_setting(
-                    "session",
-                    "idle_timeout_seconds",
-                )
-                or 300
-            )
-
-        except Exception:
-            pass
-
-        self.session = ConversationSession(
-            idle_timeout_seconds=idle_timeout,
-            busy_check=_busy,
-        )
-
-        # CHIME instead of spoken acks on re-wake: JARVIS acknowledges
-        # without contributing to the "greeting many times" problem.
-        self.wake_chime = True
-
-        # Wake-word refractory period (seconds): re-triggers inside
-        # this window after a handled wake are ignored as echoes.
-        self._wake_refractory = 1.2
-        self._last_wake_handled = 0.0
-
-    def _on_kill_switch(self, reason: str = ""):
-        """
-        Kill-switch callback: cut speech, clear pending state, cancel
-        every queued confirmation. Safe to run from the hotkey thread.
-        """
-
-        try:
-            self.interrupt_speech()
-
-        except Exception:
-            pass
-
-        try:
-            self.interrupt_requested = True
-
-            self.thinking_abort.set()
-
-        except Exception:
-            pass
-
-        try:
-            self.agent.confirmations.cancel()
-
-            self.agent._clear_transient_state()
-
-            if self.agent.recorder.is_active():
-                self.agent.recorder.cancel()
-
-        except Exception:
-            pass
-
-        try:
-            log_event("kill_switch", reason=reason)
-
-        except Exception:
-            pass
-
         # CONVERSATION HOLD: after a command, JARVIS stays in the
         # exchange for a short window waiting for follow-ups like
-        # "yes, send it" — no fresh "Hey JARVIS" needed.
+        # "yes, send it" â€” no fresh "Hey JARVIS" needed.
         self.conversation_hold_seconds = 12.0
         self.conversation_max_exchanges = 4
 
@@ -335,7 +876,7 @@ class Orchestrator:
         # spoken choices ("1. Physics notes / 2. Chemistry notes")
         # read as a natural list instead of colliding words.
         text = re.sub(
-            r"^\s*[-•]\s*",
+            r"^\s*[-â€¢]\s*",
             ", ",
             text,
             flags=re.MULTILINE,
@@ -386,30 +927,19 @@ class Orchestrator:
 
         self.text_to_speech.stop_speaking()
 
-    def _announce_silent(self, reason: str = ""):
+    def _announce_silent(self):
         """
-        Last-resort path when speech synthesis fails: show a visible
-        failure notice (the UI renders TTS_ERROR as a red banner),
-        log the exception, and keep going in text mode. Never silent
-        failure — the v4.1 audit found failures were invisible.
+        Last-resort path when speech synthesis fails: show the message
+        on screen and log it, so JARVIS never dies mid-answer.
         """
 
         notice = (
-            "Voice output failed"
-            + (f": {reason}" if reason else "")
-            + " — I'll show my replies as text until this is fixed."
+            "My speech output failed just now, so I'll stay in text "
+            "mode for this. I'm still here and listening."
         )
 
         print(notice)
-
-        log_event("tts_failed", reason=str(reason)[:200])
-
-        # The UI shows a red banner on this state.
-        try:
-            self._emit_state("TTS_ERROR")
-
-        except Exception:
-            pass
+        log_event("tts_failed")
 
         if self.on_jarvis_message:
             try:
@@ -438,45 +968,22 @@ class Orchestrator:
         def watch():
             deadline = time.time() + 120  # bounded safety
 
-            duck = getattr(self.text_to_speech, "duck_event", None)
-
             while self.speaking and time.time() < deadline:
                 try:
-                    # SHORT bursts (0.7 s): the user's "hey Jarvis" /
-                    # "stop" must be caught fast, and ducking makes
-                    # JARVIS's own voice stop masking the mic while
-                    # the burst is judged.
                     audio = self.microphone.record_until_silence(
-                        max_duration=0.7,
-                        silence_duration=0.25,
+                        max_duration=2,
+                        silence_duration=0.4,
                         threshold=0.05,
-                        start_timeout=1.0,
+                        start_timeout=1.2,
                     )
 
                     if len(audio) == 0:
-                        if duck is not None:
-                            duck.clear()
-
                         continue
-
-                    # DUCK NOW: something is happening in the room —
-                    # drop JARVIS's volume while we decide whether it
-                    # is a command (echo self-masking was the v3 bug:
-                    # "hey Jarvis" while speaking did nothing).
-                    if duck is not None:
-                        duck.set()
 
                     text = self.speech_to_text.transcribe(audio)
 
                 except Exception:
-                    if duck is not None:
-                        duck.clear()
-
                     continue
-
-                finally:
-                    if duck is not None:
-                        duck.clear()
 
                 if not self.speaking:
                     break
@@ -508,7 +1015,7 @@ class Orchestrator:
     # ------------------------------------------------------
     # THE JUDGE (reflexes pack): a spoken answer that claims an
     # action ("I've sent it") must be backed by a tool receipt from
-    # this turn. Pure code — no external model — so it can never
+    # this turn. Pure code â€” no external model â€” so it can never
     # fail open or add latency beyond a regex pass.
     # ------------------------------------------------------
 
@@ -591,12 +1098,8 @@ class Orchestrator:
             finished = self.text_to_speech.speak(text)
 
         except Exception as exc:
-            import traceback
-
-            traceback.print_exc()
-
-            self._announce_silent(str(exc)[:120])
-
+            print(f"TTS error: {exc}")
+            self._announce_silent()
             return
 
         finally:
@@ -627,11 +1130,8 @@ class Orchestrator:
         try:
             self.text_to_speech.speak(text)
         except Exception as exc:
-            import traceback
-
-            traceback.print_exc()
-
-            self._announce_silent(str(exc)[:120])
+            print(f"TTS error: {exc}")
+            self._announce_silent()
         finally:
             self.speaking = False
 
@@ -675,17 +1175,6 @@ class Orchestrator:
             self._emit_state("LISTENING")
 
         self._remember_turn(user_input, result)
-
-        # v4: tell listen_and_process whether THIS utterance ended the
-        # session (explicit goodbye / self shutdown-restart).
-        self._session_end_requested = bool(
-            isinstance(agent_result, dict)
-            and (
-                agent_result.get("go_to_sleep")
-                or agent_result.get("self_shutdown")
-                or agent_result.get("self_restart")
-            )
-        )
 
         if isinstance(agent_result, dict) and agent_result.get(
             "self_shutdown"
@@ -733,7 +1222,7 @@ class Orchestrator:
     def _proactive_note(self) -> str:
         """
         Proactive mode (config: agent.proactive_mode): surface one
-        useful observation before the user asks — low battery, high
+        useful observation before the user asks â€” low battery, high
         CPU, very high RAM. Returned between exchanges so it never
         interrupts a task. Empty string = nothing worth saying.
         """
@@ -762,22 +1251,18 @@ class Orchestrator:
                 self._last_proactive = now
 
                 return (
-                    f"Pardon the intrusion, sir — battery's at "
+                    f"Pardon the intrusion, sir â€” battery's at "
                     f"{int(battery.percent)} percent. A charger "
                     "wouldn't go amiss."
                 )
 
-            # v4.1 latency fix: cpu_percent(interval=0.5) BLOCKS the
-            # voice loop for half a second on every exchange. The
-            # non-blocking variant (interval=None) compares against
-            # the last call — good enough for a >= 92% alert.
-            cpu = psutil.cpu_percent(interval=None)
+            cpu = psutil.cpu_percent(interval=0.5)
 
             if cpu >= 92:
                 self._last_proactive = now
 
                 return (
-                    f"CPU is running at {cpu:.0f} percent, sir — "
+                    f"CPU is running at {cpu:.0f} percent, sir â€” "
                     "something's working rather hard. Shall I see "
                     "what?"
                 )
@@ -794,17 +1279,7 @@ class Orchestrator:
         # still in the room when recording starts; without this pause
         # it gets recorded as an "utterance" and JARVIS starts
         # THINKING about a word of nothing.
-        # v4.1 latency: 0.25 s of dead air on EVERY first exchange.
-        # The wake chime is ~0.3 s and quiets before this opens; 80 ms
-        # still covers the detector tail.
-        time.sleep(0.08)
-
-        # v4.1: per-exchange latency trace (data/logs/latency.log).
-        from app.latency import start_trace, stage
-
-        self._trace_id = start_trace("exchange")
-
-        stage(self._trace_id, "mic")
+        time.sleep(0.25)
 
         audio = self.microphone.record_until_silence(
             max_duration=10,
@@ -816,28 +1291,21 @@ class Orchestrator:
         print(f"Recording time: {time.time() - start:.2f}s")
 
         if len(audio) == 0:
-            from app.latency import finish_trace
-
-            finish_trace(getattr(self, "_trace_id", 0))
-
             return ""
 
         # SILENCE GUARD: peak loudness below the speech threshold
         # means the recorder caught room noise / a breath, not
         # speech. Skipping the transcription keeps a 1-2 second
         # silence from ever reaching the brain as a fake command.
-        # v4.1: the microphone normalizes speech to >= ~0.05 peak, so
-        # the guard threshold drops to 0.02 (pure noise from a quiet
-        # mic peaks ~0.005 and is still rejected).
         try:
             import numpy as _np
 
             peak = float(_np.max(_np.abs(audio)))
 
-            if peak < 0.02:
+            if peak < 0.03:
                 print(
                     "Silence/noise only (peak "
-                    f"{peak:.4f}) — not thinking."
+                    f"{peak:.4f}) â€” not thinking."
                 )
 
                 return ""
@@ -847,25 +1315,13 @@ class Orchestrator:
 
         start = time.time()
 
-        from app.latency import stage as _stage
-
-        _stage(getattr(self, "_trace_id", 0), "stt")
-
         text = self.speech_to_text.transcribe(audio)
-
-        stt_ms = (time.time() - start) * 1000
 
         print(f"Whisper time: {time.time() - start:.2f}s")
         print("YOU SAID:", text)
 
         if text and self.on_user_message:
             self.on_user_message(text)
-
-        from app.latency import add_ms as _add_ms, stage as _stage2
-
-        _add_ms(getattr(self, "_trace_id", 0), "stt_api", stt_ms)
-
-        _stage2(getattr(self, "_trace_id", 0), "brain")
 
         return text
 
@@ -875,34 +1331,26 @@ class Orchestrator:
         hold_seconds: float = 0.0,
     ) -> str:
         """
-        ONE SESSION, many exchanges (v4).
+        ONE VOICE EXCHANGE. Returns the final response text.
 
-        The session stays ACTIVE until an explicit dismissal, the
-        idle timeout (session.idle_timeout_seconds, default 5 min)
-        with NOTHING pending, or the user walks away mid-task (which
-        only ends the hold when the mic times out and nothing is
-        pending). max_followups/hold_seconds are accepted for
-        backward compatibility but no longer cap anything.
+        max_followups: keep the exchange alive after the reply,
+        listening for short follow-ups ("yes", "do it", or a new
+        command) for hold_seconds each round, without needing the
+        wake word again. 0 = single exchange (legacy behavior).
         """
 
-        self.session.activate()
-
-        self._session_end_requested = False
+        rounds = 1 + max(0, int(max_followups))
 
         response = ""
 
-        round_index = 0
-
-        while True:
-            self.session.set_substate("LISTENING")
-
+        for round_index in range(rounds):
             if round_index == 0:
                 text = self.listen()
 
             else:
                 # An expected answer ("yes", a contact pick, a skill
                 # name) gets a patient mic; a conversational hold is
-                # shorter — silence ends the ROUND, not the session.
+                # shorter â€” silence ends the exchange politely.
                 expecting = (
                     self.agent.confirmations.has_pending()
                     or getattr(self.agent, "_pending_send", None) is not None
@@ -921,30 +1369,8 @@ class Orchestrator:
                     ),
                 )
 
-            round_index += 1
-
             if not text:
-                # Silence in the hold. A2 RULE: silence inside an
-                # ACTIVE session means KEEP LISTENING quietly — the
-                # session only ends on dismissal, or the idle timeout
-                # with nothing pending. (v4.0 returned to the wake
-                # detector here, which the user experienced as "he
-                # went back to sleep".)
-                if (
-                    not self.session.is_busy()
-                    and self.session.idle_seconds()
-                    >= self.session.idle_timeout_seconds
-                ):
-                    self._say_session_farewell()
-
-                    break
-
-                # Keep the mic open and loop straight back. listen()
-                # blocks up to its own start_timeout, so this loop
-                # never spins hot.
-                continue
-
-            self.session.touch()
+                break
 
             # UTTERANCE GUARD: a wake-word echo, a cough, or a
             # transcribed breath must never reach the brain. Strip
@@ -963,15 +1389,11 @@ class Orchestrator:
                 or not re.search(r"[a-z0-9]", core, re.IGNORECASE)
             ):
                 print(
-                    "Utterance below brain threshold — ignored: "
+                    "Utterance below brain threshold â€” ignored: "
                     f"{text!r}"
                 )
 
-                # A2: a wake-word echo is not a reason to sleep.
-                # Keep the session and listen again.
-                self.session.touch()
-
-                continue
+                return ""
 
             # Arm the interrupt watcher: while JARVIS thinks/acts, the
             # user can say "stop" (or "hey Jarvis") to cancel the task.
@@ -985,15 +1407,6 @@ class Orchestrator:
             )
 
             watcher.start()
-
-            self.session.set_substate("THINKING")
-
-            # v4.1: brain latency stage (reflexes+LLM+tools all live
-            # inside process()); finer breakdown comes from the
-            # runtime's own stage calls.
-            from app.latency import stage as _brain_stage
-
-            _brain_stage(getattr(self, "_trace_id", 0), "brain")
 
             try:
                 response = self.process(text)
@@ -1009,12 +1422,10 @@ class Orchestrator:
 
                 log_event("thinking_interrupted")
 
-                self.session.touch()
-
                 if self.pending_wake_interrupt:
                     self.speak("Stopped, sir. Go ahead.")
 
-                continue
+                return ""
 
             finally:
                 self._processing_done = True
@@ -1026,12 +1437,14 @@ class Orchestrator:
 
                 log_event("task_interrupted")
 
-                self.session.touch()
-
+                # The interrupt came from "hey jarvis" mid-task: arm
+                # the wake bypass so the command they say next is
+                # heard WITHOUT repeating the wake word, and
+                # acknowledge the stop so JARVIS never seems deaf.
                 if self.pending_wake_interrupt:
                     self.speak("Stopped, sir. Go ahead.")
 
-                continue
+                return ""
 
             if self.on_jarvis_message:
                 self.on_jarvis_message(response)
@@ -1041,12 +1454,6 @@ class Orchestrator:
             # follow-up hold.
             self._emit_state("SPEAKING")
 
-            self.session.set_substate("SPEAKING")
-
-            from app.latency import stage as _tts_stage, finish_trace
-
-            _tts_stage(getattr(self, "_trace_id", 0), "tts_start")
-
             speech_text = self.clean_for_speech(response)
 
             start = time.time()
@@ -1054,11 +1461,6 @@ class Orchestrator:
             self._speak_until_done(speech_text)
 
             print(f"TTS time: {time.time() - start:.2f}s")
-
-            # Exchange complete: write the trace.
-            finish_trace(getattr(self, "_trace_id", 0))
-
-            self._trace_id = None
 
             self._emit_state("DONE")
 
@@ -1087,44 +1489,37 @@ class Orchestrator:
                     self.shutdown_now()
 
             # ------------------------------------------------
-            # v4 SESSION RULE: the task ended; the conversation did
-            # NOT. Keep holding unless the user explicitly said
-            # goodbye (or shut JARVIS down/restarted him).
+            # STAY-AWAKE RULE: the exchange NEVER dies after one
+            # reply. JARVIS always holds the mic for a follow-up â€”
+            # that's what makes it a conversation instead of
+            # walkie-talkie question-answer. An EXPECTED answer
+            # (confirmation, contact pick, message to dictate, skill
+            # name) gets a patient 12-second mic; any other reply
+            # gets a 6-second conversational hold. Silence ends the
+            # hold and returns to wake-word sleep naturally.
             # ------------------------------------------------
-            if self._session_end_requested:
-                self._session_end_requested = False
-
-                self.session.end("dismissed")
-
-                break
-
-            self.session.touch()
-
-        return response
-
-    def _say_session_farewell(self):
-        """
-        Spoken once when the session drops to wake-word mode from the
-        idle timeout — short, and never mid-task (the caller only
-        reaches here when nothing is pending).
-        """
-
-        self.session.end("idle")
-
-        self.has_greeted = False
-
-        try:
-            if self.on_jarvis_message:
-                self.on_jarvis_message(
-                    "I'll be here if you need me, sir."
-                )
-
-            self._speak_until_done(
-                "I'll be here if you need me, sir."
+            expecting_answer = (
+                self.agent.confirmations.has_pending()
+                or getattr(self.agent, "_pending_send", None) is not None
+                or getattr(self.agent, "_recorder_pending_save", None)
+                is not None
+                or getattr(self.agent, "_teaching_pending_save", None)
+                is not None
+                or getattr(self.agent, "_pending_draft", None) is not None
+                or self.agent.recorder.is_active()
             )
 
-        except Exception:
-            pass
+            # Filming mode keeps the exchange open on a long leash:
+            # the user talks to the camera; when they address JARVIS
+            # the answer comes without any wake word.
+            if expecting_answer or self.filming_mode:
+                self._emit_state("LISTENING")
+
+                # Loop: _listen_followup handles both windows via the
+                # pending-state check inside.
+                continue
+
+        return response
 
     def _listen_followup(self, start_timeout: float = 6) -> str:
         """
@@ -1147,14 +1542,12 @@ class Orchestrator:
 
         # Same silence guard as listen(): a breath or room noise in
         # the hold must never become a fake follow-up command.
-        # v4.1: matches listen()'s lowered 0.02 threshold (the mic
-        # normalizer guarantees speech peaks land well above it).
         try:
             import numpy as _np
 
             peak = float(_np.max(_np.abs(audio)))
 
-            if peak < 0.02:
+            if peak < 0.03:
                 print(
                     "Follow-up window: silence/noise only (peak "
                     f"{peak:.4f})."
@@ -1349,7 +1742,7 @@ class Orchestrator:
     def wait_for_wake_word(self, cooldown: float = 0.0):
         # A "hey jarvis" spoken DURING speech/thinking already armed
         # the exchange: skip the detector and cooldown entirely and
-        # drop straight into listening — the user should never have
+        # drop straight into listening â€” the user should never have
         # to say the wake word twice.
         if self.pending_wake_interrupt:
             self.pending_wake_interrupt = False
@@ -1384,22 +1777,8 @@ class Orchestrator:
                 detected = False
 
         if detected:
-            # v4 DEBOUNCE: a trigger inside the refractory window is
-            # the detector re-firing on the tail of the same word (or
-            # JARVIS's own reply) — never a real second "hey JARVIS".
-            now = time.time()
-
-            if now - self._last_wake_handled < self._wake_refractory:
-                print("Wake refractory: ignoring echo trigger.")
-
-                return False
-
-            self._last_wake_handled = now
-
-            self.session.activate()
-
             # Wake immediately (orb switches to LISTENING as soon as
-            # this returns, before the greeting) — see app/main.py.
+            # this returns, before the greeting) â€” see app/main.py.
             greeting = self._wakeup_greeting()
 
             if greeting:
@@ -1409,16 +1788,6 @@ class Orchestrator:
                 # Barge-in: a wake word during speech also silences it.
                 self.interrupt_speech()
                 self._speak_until_done(greeting)
-
-            elif self.wake_chime:
-                # v4: a short non-verbal chime acknowledges the wake
-                # without adding another spoken greeting — the orb
-                # lights up, the chime plays, JARVIS listens.
-                if self.on_jarvis_message:
-                    self.on_jarvis_message("Yes, sir?")
-
-                self.interrupt_speech()
-                self._play_chime()
 
             else:
                 # Brief acknowledgment so JARVIS never seems deaf, but
@@ -1432,67 +1801,15 @@ class Orchestrator:
 
         return detected
 
-    def _play_chime(self):
-        """
-        Two-note acknowledgment chime (~0.3 s). Cosmetic only: if the
-        audio device refuses, silence is the correct fallback.
-        """
-
-        try:
-            import numpy as _np
-            import sounddevice as _sd
-
-            rate = 44100
-
-            duration = 0.28
-
-            t = _np.linspace(0, duration, int(rate * duration), False)
-
-            # E6 -> A6, two quick soft notes.
-            wave = _np.zeros_like(t)
-
-            split = int(len(t) * 0.55)
-
-            wave[:split] = 0.20 * _np.sin(
-                2 * _np.pi * 1318.5 * t[:split]
-            )
-
-            wave[split:] = 0.20 * _np.sin(
-                2 * _np.pi * 1760.0 * t[split:]
-            )
-
-            # Fade edges so the chime never clicks.
-            fade = int(rate * 0.01)
-
-            wave[:fade] *= _np.linspace(0, 1, fade)
-
-            wave[-fade:] *= _np.linspace(1, 0, fade)
-
-            audio = (wave * 32767).astype(_np.int16)
-
-            stream = _sd.OutputStream(
-                samplerate=rate,
-                channels=1,
-                dtype="int16",
-            )
-
-            stream.start()
-            stream.write(audio)
-            stream.stop()
-            stream.close()
-
-        except Exception:
-            pass
-
-    # A long briefing is welcome ONCE per boot (or after 4+ hours of
-    # idle — a fresh day). After that, every wake gets a chime: the
+    # A long briefing is welcome ONCE per session (the first wake
+    # after boot). After that, every wake gets a two-word ack: the
     # user said "hey JARVIS" to give a command, not to hear a speech.
-    _GREETING_TTL_SECONDS = 4 * 3600.0
+    _GREETING_TTL_SECONDS = 90.0
 
     def _daily_briefing(self) -> str:
         """
         Morning-briefing greeting, JARVIS-style: the first wake of the
-        session opens with time, battery, and any reminder due —
+        session opens with time, battery, and any reminder due â€”
         delivered like a butler, not a status dump.
         Failures degrade to a plain "Yes, sir?" silently.
         """
@@ -1538,7 +1855,7 @@ class Orchestrator:
 
                 elif percent <= 20:
                     pieces.append(
-                        f"Battery's at {percent} percent — I'd find a "
+                        f"Battery's at {percent} percent â€” I'd find a "
                         "charger soon, sir."
                     )
 
@@ -1550,7 +1867,7 @@ class Orchestrator:
         except Exception:
             pass
 
-        # Memory size — the pack's "N notes indexed, all present and
+        # Memory size â€” the pack's "N notes indexed, all present and
         # accounted for" flavor.
         try:
             fact_count = len(self.agent.tools.memory.all_facts())
@@ -1564,7 +1881,7 @@ class Orchestrator:
         except Exception:
             pass
 
-        # "What needs me" — pending reminders plus anything urgent in
+        # "What needs me" â€” pending reminders plus anything urgent in
         # the activity log (tool failures worth mentioning).
         try:
             needs = []
@@ -1664,15 +1981,8 @@ class Orchestrator:
 
             return "I've restarted myself. All systems are back online, sir."
 
-        # Explicit sleep resets the greeting flag; honor it only when
-        # the user has actually been away a while.
         if self.has_greeted:
-            idle = time.time() - getattr(self, "_last_activity", 0.0)
-
-            if idle < self._GREETING_TTL_SECONDS:
-                return None
-
-            self.has_greeted = False
+            return None
 
         # The briefing only deserves its slot when the user has been
         # away: right after a restart acknowledgment (fresh boot) or
@@ -1706,3 +2016,6 @@ if __name__ == "__main__":
 
             if response:
                 print("JARVIS:", response)
+
+===== C:\Users\Urav Agarwal\Projects\Jarvis\assistant\__init__.py =====
+

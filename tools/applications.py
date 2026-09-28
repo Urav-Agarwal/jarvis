@@ -104,15 +104,26 @@ class ApplicationManager:
 
         return False
 
-    def _open_via_start_apps(self, requested: str) -> bool:
-        """
-        Resolve an app against the Windows 'Get-StartApps' registry
-        (all apps the Start menu can launch, including Store apps
-        without .lnk files), then launch by its AUMID shell: URI.
-        """
+    # v4.1 LATENCY: Get-StartApps shells out to PowerShell (~1-3 s).
+    # Cache the list for an hour — a fresh app install appears after
+    # at most one slow request instead of taxing every request.
+    _START_APPS_CACHE = None
 
-        if not requested:
-            return False
+    _START_APPS_CACHE_AT = 0.0
+
+    _START_APPS_TTL = 3600.0
+
+    @classmethod
+    def _get_start_apps(cls):
+        import time as _time
+
+        now = _time.time()
+
+        if (
+            cls._START_APPS_CACHE is not None
+            and now - cls._START_APPS_CACHE_AT < cls._START_APPS_TTL
+        ):
+            return cls._START_APPS_CACHE
 
         try:
             import subprocess
@@ -132,6 +143,37 @@ class ApplicationManager:
 
             if isinstance(apps, dict):
                 apps = [apps]
+
+            cls._START_APPS_CACHE = apps
+
+            cls._START_APPS_CACHE_AT = now
+
+            return apps
+
+        except Exception:
+            # Keep the old cache (if any) on failure; empty list is a
+            # valid answer for machines without Get-StartApps.
+            if cls._START_APPS_CACHE is None:
+                cls._START_APPS_CACHE = []
+
+                cls._START_APPS_CACHE_AT = now
+
+            return cls._START_APPS_CACHE
+
+    def _open_via_start_apps(self, requested: str) -> bool:
+        """
+        Resolve an app against the Windows 'Get-StartApps' registry
+        (all apps the Start menu can launch, including Store apps
+        without .lnk files), then launch by its AUMID shell: URI.
+        """
+
+        if not requested:
+            return False
+
+        try:
+            import os as _os
+
+            apps = self._get_start_apps()
 
             def normalized(value):
                 return " ".join(

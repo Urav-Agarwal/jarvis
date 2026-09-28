@@ -352,6 +352,17 @@ orch2._judge_answer = lambda q, a: a
 
 orch2.listen = lambda: ""  # silence right away
 
+# A2: after first-listen silence the session loops to the follow-up
+# mic; silence there too. The idle clock stays fresh, so the loop
+# would spin forever with a static fake — age the clock on each mic
+# call by more than the 60 s timeout to end the session.
+def silent_and_aged_first(start_timeout=6):
+    orch2.session._last_activity -= 120
+
+    return ""
+
+orch2._listen_followup = silent_and_aged_first
+
 farewell_spoken = []
 
 orch2._say_session_farewell = lambda: (
@@ -361,21 +372,30 @@ orch2._say_session_farewell = lambda: (
 
 orch2.listen_and_process()
 
+# A2 contract: silence inside an ACTIVE session KEEPS the session
+# (the loop goes back to the mic). The farewell fires only from the
+# idle timeout — which the aging fake mic above forces.
 check(
-    "session: first-listen silence ends politely (no farewell)",
-    not farewell_spoken,
+    "session: silence keeps session until idle timeout (A2)",
+    bool(farewell_spoken)
+    and orch2.session.state == SessionState.DORMANT,
+    f"state={orch2.session.state}",
 )
 
 # Long-idle silence: the idle clock must elapse DURING the mic call
 # (activate/set_substate refresh it at every loop boundary — correct,
-# since real interaction just happened). Simulate a mic that waited
-# far past the timeout.
+# since real interaction just happened). Simulate mics that waited
+# far past the timeout. A2: silence inside a session LOOPS back to
+# the mic instead of returning to wake-word mode, so both listen
+# paths must be faked.
 def silent_and_aged():
     orch2.session._last_activity -= 999
 
     return ""
 
 orch2.listen = silent_and_aged
+
+orch2._listen_followup = silent_and_aged
 
 orch2.listen_and_process()
 
