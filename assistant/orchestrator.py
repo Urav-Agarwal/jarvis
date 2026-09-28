@@ -10,6 +10,7 @@ from PySide6.QtWidgets import QApplication
 from ai.agent_runtime import AgentRuntime
 from ai.provider import GroqProvider
 from app.activity_log import log_event
+from assistant.session import SessionState
 from audio.microphone import Microphone
 from audio.speech_to_text import SpeechToText
 from audio.text_to_speech import TextToSpeech
@@ -835,12 +836,16 @@ class Orchestrator:
 
         audio = self.microphone.record_until_silence(
             max_duration=10,
-            silence_duration=0.8,
+            silence_duration=0.7,
             threshold=0.03,
             start_timeout=5,
         )
 
         print(f"Recording time: {time.time() - start:.2f}s")
+
+        # v4.1.2: remember whether the capture actually held audio so
+        # the caller can tell "spoke but unintelligible" from silence.
+        self._last_capture_had_audio = len(audio) > 0
 
         if len(audio) == 0:
             from app.latency import finish_trace
@@ -885,6 +890,19 @@ class Orchestrator:
         print(f"Whisper time: {time.time() - start:.2f}s")
         print("YOU SAID:", text)
 
+        # v4.1.2: evidence trail for the listen path.
+        try:
+            from audio.microphone import _mic_log
+
+            _mic_log(
+                f"stt: {len(audio)} samples "
+                f"({len(audio) / self.microphone.sample_rate:.2f}s) "
+                f"-> {text!r} ({stt_ms:.0f}ms)"
+            )
+
+        except Exception:
+            pass
+
         if text and self.on_user_message:
             self.on_user_message(text)
 
@@ -915,6 +933,15 @@ class Orchestrator:
         self.session.activate()
 
         self._session_end_requested = False
+
+        # v4.1.2: the "didn't catch" prompt fires at most ONCE per
+        # session-loop, and only when real audio reached STT.
+        self._empty_prompt_spoken = False
+
+        # Set by listen(): whether the mic captured actual audio
+        # (distinguishes "user spoke but STT heard nothing" from
+        # "pure silence").
+        self._last_capture_had_audio = False
 
         response = ""
 
@@ -951,6 +978,19 @@ class Orchestrator:
             round_index += 1
 
             if not text:
+                # v4.1.2: STT returned NOTHING after real audio. That
+                # is the ONLY case worth a quiet spoken prompt — and
+                # only ONCE per exchange, never in a loop.
+                if round_index == 1 and self._last_capture_had_audio:
+                    if not self._empty_prompt_spoken:
+                        self._empty_prompt_spoken = True
+
+                        self.speak("Sorry, I didn't catch that.")
+
+                    continue
+
+                self._empty_prompt_spoken = False
+
                 # Silence in the hold. A2 RULE: silence inside an
                 # ACTIVE session means KEEP LISTENING quietly — the
                 # session only ends on dismissal, or the idle timeout
@@ -1423,39 +1463,44 @@ class Orchestrator:
 
             self._last_wake_handled = now
 
+            # v4.1.2: ignore wake events while JARVIS is speaking —
+            # that is a BARGE-IN handled by _start_stop_listener (it
+            # cuts the speech and arms pending_wake_interrupt); the
+            # wake path itself must not re-greet over his own voice.
+            if self.speaking:
+                print("Wake ignored: JARVIS is speaking (barge-in path).")
+
+                return False
+
+            already_active = (
+                self.session.state != SessionState.DORMANT
+            )
+
             self.session.activate()
 
-            # Wake immediately (orb switches to LISTENING as soon as
-            # this returns, before the greeting) — see app/main.py.
-            greeting = self._wakeup_greeting()
+            # v4.1.2 CHIME ONLY: the wake acknowledgment is the chime,
+            # never speech ("Yes, sir?" contributed to the 'greeting
+            # many times' complaint). A full briefing is welcome ONLY
+            # when coming out of DORMANT (fresh boot / 4h+ idle); an
+            # ACTIVE session NEVER gets a greeting.
+            greeting = None
+
+            if not already_active:
+                greeting = self._wakeup_greeting()
 
             if greeting:
                 if self.on_jarvis_message:
                     self.on_jarvis_message(greeting)
 
-                # Barge-in: a wake word during speech also silences it.
                 self.interrupt_speech()
                 self._speak_until_done(greeting)
 
-            elif self.wake_chime:
-                # v4: a short non-verbal chime acknowledges the wake
-                # without adding another spoken greeting — the orb
-                # lights up, the chime plays, JARVIS listens.
+            else:
                 if self.on_jarvis_message:
-                    self.on_jarvis_message("Yes, sir?")
+                    self.on_jarvis_message("[chime]")
 
                 self.interrupt_speech()
                 self._play_chime()
-
-            else:
-                # Brief acknowledgment so JARVIS never seems deaf, but
-                # no repetition of the greeting: a two-word "Yes, sir?"
-                # keeps the exchange moving.
-                if self.on_jarvis_message:
-                    self.on_jarvis_message("Yes, sir?")
-
-                self.interrupt_speech()
-                self._speak_until_done("Yes, sir?")
 
         return detected
 

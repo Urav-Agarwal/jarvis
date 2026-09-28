@@ -71,7 +71,12 @@ class WakeWordDetector:
 
         self._agc_target_rms = 0.05
 
-        self._agc_max_gain = 25.0
+        # v4.1.2: the user fixed the mic at the Windows level — raw
+        # speech peaks are now 0.2-0.3 (was ~0.003). A 25x gain on a
+        # healthy mic would amplify ROOM NOISE into the wake model's
+        # range and pump false triggers. Cap the gain low: a good mic
+        # needs none; a quiet one still gets a gentle boost.
+        self._agc_max_gain = 2.0
 
         self._agc_gain = 1.0
 
@@ -120,6 +125,17 @@ class WakeWordDetector:
         if frame_rms < 1e-6:
             # Digital silence: keep the last gain, do not divide.
             self.last_gain = self._agc_gain
+
+            return audio
+
+        # NO-NOISE AMPLIFICATION (v4.1.2): when the frame is at/below
+        # the room level, hold the gain at 1.0 (do NOT boost room
+        # noise towards the speech target). Gain may only RISE while
+        # frames already look speech-like (rms >= 0.01).
+        if frame_rms < 0.01:
+            self._agc_gain = 1.0
+
+            self.last_gain = 1.0
 
             return audio
 
