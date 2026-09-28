@@ -176,6 +176,54 @@ class Orchestrator:
         self._wake_refractory = 1.2
         self._last_wake_handled = 0.0
 
+        # ------------------------------------------------------------------
+        # BOOT TAIL (v4.1 FIX): this block used to live inside
+        # _on_kill_switch after a bad method splice, which left
+        # stop_listener_enabled/speaking/_last_activity UNDEFINED on a
+        # fresh Orchestrator. _speak_until_done then raised
+        # AttributeError BEFORE TTS ever started — the "JARVIS is
+        # silent + listener loop error" regression.
+        # ------------------------------------------------------------------
+
+        # CONVERSATION HOLD: after a command, JARVIS stays in the
+        # exchange for a short window waiting for follow-ups like
+        # "yes, send it" — no fresh "Hey JARVIS" needed.
+        self.conversation_hold_seconds = 12.0
+        self.conversation_max_exchanges = 4
+
+        if self.restart_acknowledged:
+            try:
+                os.remove(_RESTART_FLAG)
+            except OSError:
+                pass
+
+        self.speaking = False
+
+        # Barge-in listener during speech. CRITICAL: without this
+        # attribute _speak_until_done raises before ANY audio plays.
+        self.stop_listener_enabled = True
+
+        # Greeting window: the boot moment. The first "hey JARVIS"
+        # after startup earns the full briefing; later wakes within
+        # the TTL get a brief "Yes, sir?" instead (see
+        # _wakeup_greeting).
+        self._last_activity = time.time()
+
+        # Boot sanity: the reply path (_speak_until_done) hard-depends
+        # on these; fail loudly at boot instead of going mute.
+        for _attr in (
+            "stop_listener_enabled",
+            "speaking",
+            "text_to_speech",
+            "pending_wake_interrupt",
+            "_processing_done",
+            "session",
+        ):
+            if not hasattr(self, _attr):
+                raise RuntimeError(
+                    f"Orchestrator boot incomplete: missing {_attr}"
+                )
+
     def _on_kill_switch(self, reason: str = ""):
         """
         Kill-switch callback: cut speech, clear pending state, cancel
@@ -212,27 +260,6 @@ class Orchestrator:
 
         except Exception:
             pass
-
-        # CONVERSATION HOLD: after a command, JARVIS stays in the
-        # exchange for a short window waiting for follow-ups like
-        # "yes, send it" — no fresh "Hey JARVIS" needed.
-        self.conversation_hold_seconds = 12.0
-        self.conversation_max_exchanges = 4
-
-        if self.restart_acknowledged:
-            try:
-                os.remove(_RESTART_FLAG)
-            except OSError:
-                pass
-
-        self.speaking = False
-        self.stop_listener_enabled = True
-
-        # Greeting window: the boot moment. The first "hey JARVIS"
-        # after startup earns the full briefing; later wakes within
-        # the TTL get a brief "Yes, sir?" instead (see
-        # _wakeup_greeting).
-        self._last_activity = time.time()
 
     def clean_for_speech(self, text: str) -> str:
         # 1. Markdown links: keep visible text, drop the URL.
