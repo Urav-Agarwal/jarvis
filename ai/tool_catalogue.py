@@ -32,6 +32,43 @@ class ToolCatalogue:
             ),
 
             ToolDefinition(
+                name="computer.mouse_double_click",
+                description="Double-click at the current cursor position (opens shortcuts, files, icons).",
+                parameters={
+                    "button": "string",
+                },
+                risk="low",
+                confirmation_required=False,
+            ),
+
+            ToolDefinition(
+                name="computer.mouse_drag",
+                description="Drag (hold left button, glide, release) to screen position x,y.",
+                parameters={
+                    "x": "integer",
+                    "y": "integer",
+                },
+                risk="medium",
+                confirmation_required=False,
+            ),
+
+            ToolDefinition(
+                name="computer.open_shortcut",
+                description=(
+                    "Open a desktop shortcut (.lnk/.url) by name without "
+                    "pixel clicking: 'open the Instagram shortcut on my "
+                    "desktop'. Fuzzy-matches the shortcut name and starts "
+                    "the target directly. USE THIS before trying to click "
+                    "desktop icons." 
+                ),
+                parameters={
+                    "name": "string",
+                },
+                risk="low",
+                confirmation_required=False,
+            ),
+
+            ToolDefinition(
                 name="computer.mouse_scroll",
                 description="Scroll the mouse wheel.",
                 parameters={

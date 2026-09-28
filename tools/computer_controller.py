@@ -1,5 +1,39 @@
 import ctypes
+import ctypes.wintypes
+import math
 import time
+
+
+_DPI_APPLIED = False
+
+
+def ensure_dpi_awareness():
+    """
+    Make this process per-monitor DPI aware so screenshot pixels and
+    SetCursorPos coordinates both live in PHYSICAL pixels. Without
+    this, on a scaled display (125%/150%) the vision step returns
+    coordinates that are systematically wrong and the cursor clicks
+    the wrong spot (or appears never to move towards the target).
+    Idempotent; safe to call from any module.
+    """
+
+    global _DPI_APPLIED
+
+    if _DPI_APPLIED:
+        return
+
+    try:
+        # Windows 8.1+: per-monitor aware (value 2).
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)
+
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+
+        except Exception:
+            pass
+
+    _DPI_APPLIED = True
 
 
 class ComputerController:
@@ -26,17 +60,98 @@ class ComputerController:
     VK_LEFT = 0x25
     VK_RIGHT = 0x27
 
-    def move_mouse(self, x: int, y: int):
+    # A double-click is two clicks inside the system double-click
+    # time (default 500 ms); ~90 ms is comfortably inside it.
+    DOUBLE_CLICK_INTERVAL = 0.09
+
+    # Kill-switch hook: the orchestrator sets this Event and every
+    # glide/click/drag bails out mid-motion.
+    abort_event = None
+
+    def __init__(self):
+        ensure_dpi_awareness()
+
+    @staticmethod
+    def _aborted():
+        abort = ComputerController.abort_event
+
+        return bool(abort is not None and abort.is_set())
+
+    @staticmethod
+    def _cursor_position():
+        point = ctypes.wintypes.POINT()
+
+        ctypes.windll.user32.GetCursorPos(ctypes.byref(point))
+
+        return point.x, point.y
+
+    def move_mouse(self, x: int, y: int, duration: float = 0.45):
+        """
+        GLIDE to (x, y): interpolate the path with ease-in-out so the
+        cursor visibly moves instead of teleporting (v3 used bare
+        SetCursorPos, so "double-click the Instagram shortcut" looked
+        like nothing happened). duration < 0.05 keeps instant
+        teleport behavior for callers that want it.
+        """
+
+        ensure_dpi_awareness()
+
+        x = int(x)
+        y = int(y)
+
+        start_x, start_y = self._cursor_position()
+
+        duration = max(0.0, float(duration))
+
+        if duration < 0.05 or self._aborted():
+            ctypes.windll.user32.SetCursorPos(x, y)
+
+            return {"success": True, "x": x, "y": y, "glided": False}
+
+        # Ease-in-out quad: slow start, faster middle, slow settle.
+        steps = max(6, min(40, int(duration * 60)))
+
+        for index in range(1, steps + 1):
+            if self._aborted():
+                return {
+                    "success": False,
+                    "error": "mouse movement cancelled",
+                    "x": start_x,
+                    "y": start_y,
+                }
+
+            progress = index / steps
+
+            eased = (
+                2 * progress * progress
+                if progress < 0.5
+                else 1 - ((-2 * progress + 2) ** 2) / 2
+            )
+
+            current_x = int(round(start_x + (x - start_x) * eased))
+            current_y = int(round(start_y + (y - start_y) * eased))
+
+            ctypes.windll.user32.SetCursorPos(current_x, current_y)
+
+            time.sleep(duration / steps)
+
+        # Land exactly on target (rounding drift above).
         ctypes.windll.user32.SetCursorPos(x, y)
 
-        return {
-            "success": True,
-            "x": x,
-            "y": y,
-        }
+        return {"success": True, "x": x, "y": y, "glided": True}
 
-    def click_mouse(self, button: str = "left"):
-        button = button.lower().strip()
+    def click_mouse(self, button: str = "left", clicks: int = 1):
+        """
+        Click 1..3 times. clicks=2 is a REAL double-click: two down/up
+        pairs inside the system double-click time. The v3 catalogue
+        declared a `clicks` parameter but the controller only ever
+        clicked once — "double-click the shortcut" did nothing.
+        """
+
+        if self._aborted():
+            return {"success": False, "error": "click cancelled"}
+
+        button = (button or "left").lower().strip()
 
         buttons = {
             "left": (
@@ -55,28 +170,42 @@ class ComputerController:
                 "error": f"Unsupported mouse button: {button}",
             }
 
+        try:
+            count = max(1, min(3, int(clicks)))
+
+        except (TypeError, ValueError):
+            count = 1
+
         down, up = buttons[button]
 
-        ctypes.windll.user32.mouse_event(
-            down,
-            0,
-            0,
-            0,
-            0,
-        )
+        for index in range(count):
+            ctypes.windll.user32.mouse_event(down, 0, 0, 0, 0)
+            ctypes.windll.user32.mouse_event(up, 0, 0, 0, 0)
+
+            if index < count - 1:
+                time.sleep(self.DOUBLE_CLICK_INTERVAL)
+
+        return {"success": True, "button": button, "clicks": count}
+
+    def drag_mouse(self, x: int, y: int, duration: float = 0.5):
+        """Press left, glide to (x, y), release."""
+
+        if self._aborted():
+            return {"success": False, "error": "drag cancelled"}
 
         ctypes.windll.user32.mouse_event(
-            up,
-            0,
-            0,
-            0,
-            0,
+            self.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0
         )
 
-        return {
-            "success": True,
-            "button": button,
-        }
+        time.sleep(0.08)
+
+        result = self.move_mouse(x, y, duration=duration)
+
+        ctypes.windll.user32.mouse_event(
+            self.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0
+        )
+
+        return result
 
     def scroll_mouse(self, amount: int):
         ctypes.windll.user32.mouse_event(

@@ -50,6 +50,28 @@ class Orchestrator:
             interrupt_check=lambda: self.interrupt_requested,
         )
 
+        # KILL SWITCH (v4): one switch halts speech, mouse motion,
+        # LLM calls, plans and confirmations. Wired into the mouse
+        # controller and the provider; callbacks cut speech and
+        # clear pending state. Global hotkey Ctrl+Alt+Shift+J.
+        from security.kill_switch import get_kill_switch
+
+        self.kill_switch = get_kill_switch()
+
+        self.kill_switch.on_trigger(self._on_kill_switch)
+
+        self.kill_switch.install_hotkey()
+
+        try:
+            from tools.computer_controller import ComputerController
+
+            ComputerController.abort_event = self.kill_switch.abort_event
+
+        except Exception:
+            pass
+
+        self.ai.abort_events = [self.kill_switch.abort_event]
+
         # Give the runtime and the brain direct access to the same
         # abort event (checked inside provider.generate).
         self.agent.abort_event = self.thinking_abort
@@ -97,6 +119,43 @@ class Orchestrator:
         # the room; the wake-word detector gets a cooldown before it
         # may trigger again (tuned past the tail of spoken replies).
         self.wake_cooldown = 2.2
+
+    def _on_kill_switch(self, reason: str = ""):
+        """
+        Kill-switch callback: cut speech, clear pending state, cancel
+        every queued confirmation. Safe to run from the hotkey thread.
+        """
+
+        try:
+            self.interrupt_speech()
+
+        except Exception:
+            pass
+
+        try:
+            self.interrupt_requested = True
+
+            self.thinking_abort.set()
+
+        except Exception:
+            pass
+
+        try:
+            self.agent.confirmations.cancel()
+
+            self.agent._clear_transient_state()
+
+            if self.agent.recorder.is_active():
+                self.agent.recorder.cancel()
+
+        except Exception:
+            pass
+
+        try:
+            log_event("kill_switch", reason=reason)
+
+        except Exception:
+            pass
 
         # CONVERSATION HOLD: after a command, JARVIS stays in the
         # exchange for a short window waiting for follow-ups like

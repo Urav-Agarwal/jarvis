@@ -165,6 +165,9 @@ check(
 )
 
 # Non-matching input must NOT re-ask; it cancels and processes fresh.
+# (v4 note: "what time is it" is now a zero-LLM reflex, so a scripted
+# response would never be consumed — use a request that still reaches
+# the reasoning loop.)
 runtime.confirmations.request_confirmation(
     "system.shutdown",
     {},
@@ -173,11 +176,11 @@ runtime.confirmations.request_confirmation(
 
 provider.queue(
     json.dumps(
-        {"type": "question", "request": "What time is it?"}
+        {"type": "question", "request": "What is the capital of France?"}
     )
 )
 
-other = runtime.process("what time is it", context="")
+other = runtime.process("what is the capital of france", context="")
 
 check(
     "other_input_cancels_and_processes",

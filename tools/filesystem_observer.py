@@ -201,6 +201,15 @@ class FileSystemObserver:
             }
 
     def delete(self, path: str):
+        r"""
+        v4: send to the Recycle Bin (send2trash) instead of permanent
+        deletion, and REFUSE protected locations outright: drive
+        roots, C:\Windows, Program Files (and anything inside those
+        system trees), the user profile root, the JARVIS project
+        itself, and any .git directory. Deeper user folders
+        (Downloads, Documents) stay deletable — Recycle Bin only.
+        """
+
         target = Path(path).expanduser()
 
         if not target.exists():
@@ -209,18 +218,39 @@ class FileSystemObserver:
                 "error": f"Path not found: {path}",
             }
 
+        protected = self._protected_reason(target)
+
+        if protected:
+            return {
+                "success": False,
+                "error": (
+                    f"Refusing to delete {target} — {protected}. "
+                    "That location is protected, sir."
+                ),
+            }
+
         try:
-            if target.is_dir():
-                shutil.rmtree(target)
-                operation = "delete_directory"
-            else:
-                target.unlink()
-                operation = "delete_file"
+            from send2trash import send2trash
+
+            send2trash(str(target))
 
             return {
                 "success": True,
-                "operation": operation,
+                "operation": "recycle",
                 "path": str(target),
+                "message": (
+                    f"Moved {target.name} to the Recycle Bin."
+                ),
+            }
+
+        except ImportError:
+            # send2trash unavailable: fail SAFE, never rmtree.
+            return {
+                "success": False,
+                "error": (
+                    "Recycle Bin support is missing; deletion "
+                    "refused for safety."
+                ),
             }
 
         except OSError as error:
@@ -228,6 +258,54 @@ class FileSystemObserver:
                 "success": False,
                 "error": str(error),
             }
+
+    @staticmethod
+    def _protected_reason(target: Path) -> str:
+        r"""Return why this path must not be deleted, or "" if safe."""
+
+        try:
+            resolved = target.resolve()
+
+        except OSError:
+            resolved = target
+
+        # Drive roots (C:\, D:\, ...).
+        if resolved.drive and resolved.parent == resolved:
+            return "it is a drive root"
+
+        # Exact-match protected location: the profile root itself.
+        # Its CHILDREN (Downloads/Documents) stay deletable.
+        try:
+            if resolved == Path.home().resolve():
+                return "it is a protected location"
+
+        except OSError:
+            pass
+
+        # System trees and the JARVIS project tree: nothing inside
+        # them may be deleted.
+        system_trees = [
+            Path("C:\\Windows"),
+            Path("C:\\Program Files"),
+            Path("C:\\Program Files (x86)"),
+            Path.cwd(),
+        ]
+
+        for directory in system_trees:
+            try:
+                resolved_parent = resolved.parent
+
+                if resolved == directory or directory == resolved_parent or directory in resolved.parents:
+                    return "it is inside a protected system location"
+
+            except OSError:
+                continue
+
+        # Any .git directory.
+        if ".git" in resolved.parts:
+            return "it is inside a .git directory"
+
+        return ""
 
     def get_type(self, path: str):
         target = Path(path).expanduser()

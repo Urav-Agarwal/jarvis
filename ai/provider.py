@@ -53,11 +53,26 @@ class GroqProvider:
         the orchestrator share a threading.Event here, so a spoken
         "stop" / "hey jarvis" DURING thinking aborts the in-flight
         call within ~0.2s instead of after the provider finishes.
+
+        v4: `abort_events` (a LIST) is also honored — the kill switch
+        adds a second event so Ctrl+Alt+Shift+J / "emergency stop"
+        aborts an in-flight call even when the interrupt watcher did
+        not fire.
         """
 
-        abort = getattr(self, "abort_event", None)
+        aborts = list(getattr(self, "abort_events", None) or [])
 
-        if abort is None:
+        single = getattr(self, "abort_event", None)
+
+        if single is not None and single not in aborts:
+            aborts.append(single)
+
+        abort = aborts[0] if aborts else None
+
+        def _aborted():
+            return any(event.is_set() for event in aborts)
+
+        if not aborts:
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=self._messages(prompt),
@@ -93,7 +108,7 @@ class GroqProvider:
         while worker.is_alive():
             worker.join(timeout=0.2)
 
-            if abort.is_set():
+            if _aborted():
                 raise InterruptedError(
                     "thinking interrupted by the user"
                 )

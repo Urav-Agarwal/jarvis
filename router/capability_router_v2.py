@@ -52,6 +52,11 @@ _SYSTEM_TERMS = [
     "storage", "disk", "wifi", "wi-fi", "bluetooth", "network",
     "lock the laptop", "lock my laptop", "lock the computer",
     "lock my computer", "sleep", "restart", "shutdown", "shut down",
+    # Time/date observations (bug 2.2: "what time is it" never
+    # reached the system capability in v3).
+    "what time is it", "the time", "what's the time", "whats the time",
+    "today's date", "todays date", "what day is it", "day of the week",
+    "current time", "current date",
 ]
 
 # Observation of which apps/windows are open ("what applications are

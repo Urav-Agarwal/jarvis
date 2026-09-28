@@ -1,0 +1,30 @@
+# JARVIS v4 permission configuration.
+#
+# Tiers:
+#   READ    observe only (battery, time, screenshots, running apps)
+#   LOW     open apps, volume, media, navigation (easily reversible)
+#   MEDIUM  type/click/drag, create/move/copy files (undoable)
+#   HIGH    delete, send messages, post, shutdown/restart, install
+#           (irreversible -> ALWAYS confirmed aloud)
+#
+# tool_tiers overrides the catalogue's risk-derived tier per tool.
+# always_confirm / never_confirm force the spoken-confirmation gate
+# regardless of tier.
+
+tool_tiers:
+  filesystem.delete: HIGH
+  system.shutdown: HIGH
+  system.restart: HIGH
+  system.lock: MEDIUM
+  application.close: MEDIUM
+  application.close_all: HIGH
+  application.send_message: HIGH
+  computer.mouse_drag: MEDIUM
+  computer.keyboard_type: MEDIUM
+  computer.mouse_click: MEDIUM
+  computer.mouse_double_click: MEDIUM
+  browser.navigate: LOW
+  browser.close_tabs: MEDIUM
+
+always_confirm: []
+never_confirm: []

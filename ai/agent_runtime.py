@@ -106,6 +106,9 @@ class AgentRuntime:
         The gate lives HERE so every path — the loop, plans, reflexes,
         repairs — is covered. Confirmed pending actions are executed
         via tools.execute directly (they already passed this gate).
+
+        v4: every decision (auto / confirmed) is audited with its
+        permission tier.
         """
 
         parameters = dict(parameters or {})
@@ -122,14 +125,33 @@ class AgentRuntime:
                 description,
             )
 
+            _audit_action(
+                tool_name,
+                parameters,
+                tier=_tier_for_tool(self, tool_name),
+                decision="pending",
+                result=message,
+            )
+
             return {
                 "confirmation_required": True,
                 "result": message,
             }
 
+        started = time.time()
+
         result = self.tools.execute(tool_name, parameters)
 
         self._set_tool_receipt(tool_name, parameters, result)
+
+        _audit_action(
+            tool_name,
+            parameters,
+            tier=_tier_for_tool(self, tool_name),
+            decision="auto",
+            result=result,
+            elapsed_ms=(time.time() - started) * 1000,
+        )
 
         return result
 
@@ -141,9 +163,20 @@ class AgentRuntime:
 
         parameters = dict(parameters or {})
 
+        started = time.time()
+
         result = self.tools.execute(tool_name, parameters)
 
         self._set_tool_receipt(tool_name, parameters, result)
+
+        _audit_action(
+            tool_name,
+            parameters,
+            tier=_tier_for_tool(self, tool_name),
+            decision="confirmed",
+            result=result,
+            elapsed_ms=(time.time() - started) * 1000,
+        )
 
         return result
 
@@ -246,6 +279,19 @@ class AgentRuntime:
 
         if reflex_reply is not None:
             return reflex_reply
+
+        # -------------------------------------------------
+        # TIME / DATE REFLEX (zero LLM): "what time is it" must be
+        # instant and exact — the v3 failure was routing it through
+        # the reasoning loop, which hallucinated or stalled. It runs
+        # AFTER the reflex layer so an answer to OUR pending question
+        # (which must cancel it) is never eaten as a time request.
+        # -------------------------------------------------
+
+        time_reply = self._handle_time_question(user_input)
+
+        if time_reply is not None:
+            return time_reply
 
         # -------------------------------------------------
         # SELF SHUTDOWN / RESTART (explicit user command): the
@@ -437,6 +483,62 @@ class AgentRuntime:
         self._pending_send = None
         self._pending_contact_choices = []
         self._recorder_pending_save = None
+
+    # ------------------------------------------------------
+    # TIME / DATE REFLEX (zero LLM)
+    # ------------------------------------------------------
+
+    _TIME_QUESTION = re.compile(
+        r"^\s*(?:hey\s+)?(?:jarvis|jamvis)?\s*"
+        r"(?:what(?:'s| is)?(?:\s+the)?\s+(?:current\s+)?time"
+        r"|what\s+time\s+(?:is\s+it|do\s+you\s+have)"
+        r"|tell\s+me\s+the\s+time"
+        r"|what(?:'s| is)?\s+today(?:'s)?\s+date"
+        r"|what\s+is\s+the\s+date(?:\s+today)?"
+        r"|what\s+day\s+is\s+it(?:\s+today)?"
+        r"|what\s+day\s+of\s+the\s+week\s+is\s+it"
+        r"|date\s+today|time\s+please|current\s+time"
+        r"|current\s+date)\b[^a-z]*\s*$",
+        re.IGNORECASE,
+    )
+
+    def _handle_time_question(self, user_input):
+        """
+        "What time is it" / "what's the date" / "what day is it" —
+        answered from the local clock with no LLM call, no routing,
+        no reasoning loop. IST (the machine's own timezone).
+        """
+
+        if not self._TIME_QUESTION.match(user_input.strip()):
+            return None
+
+        from datetime import datetime
+
+        now = datetime.now()
+
+        time_text = now.strftime("%I:%M %p").lstrip("0")
+
+        date_text = now.strftime("%A, %d %B %Y")
+
+        lowered = user_input.lower()
+
+        if "day" in lowered and "time" not in lowered:
+            message = f"It's {now.strftime('%A')}, sir."
+
+        elif "date" in lowered and "time" not in lowered:
+            message = f"Today is {date_text}, sir."
+
+        else:
+            message = (
+                f"It's {time_text}, sir — {date_text}."
+            )
+
+        log_event("time_reflex", request=user_input[:80])
+
+        return {
+            "success": True,
+            "result": message,
+        }
 
     # ------------------------------------------------------
     # THE JUDGE: receipt helpers (see BrainV3 wiring below)
@@ -2069,11 +2171,14 @@ class AgentRuntime:
     # CONFIRMATION WORD MATCHING (fuzzy, voice-friendly)
     # ------------------------------------------------------
 
+    # v4 STRICT YES/NO: whole-utterance clear phrases only. v3
+    # accepted any sentence STARTING with "ok"/"sure"/"right" —
+    # "ok so what time is it" while a confirmation pended would
+    # execute a HIGH-tier action by accident.
     _YES_PREFIXES = (
-        "yes", "yeah", "yep", "yup", "sure", "okay", "ok",
-        "confirmed", "confirm", "do it", "go ahead", "proceed",
-        "sounds good", "affirmative", "of course", "please do",
-        "do that", "go on", "alright", "right",
+        "yes", "yeah", "yep", "yup", "sure thing", "do it",
+        "confirmed", "confirm", "go ahead", "proceed",
+        "affirmative", "please do", "do that", "go on",
     )
 
     _NO_PREFIXES = (
@@ -2082,33 +2187,78 @@ class AgentRuntime:
         "negative",
     )
 
+    # Words that may FOLLOW a yes/no phrase without adding new
+    # intent ("yes, do it please, sir"). Anything else after the
+    # phrase means the utterance is a NEW request, not an answer.
+    _YES_REINFORCERS = {
+        "do", "it", "please", "go", "ahead", "definitely",
+        "absolutely", "of", "course", "sir", "jarvis", "jamvis",
+        "you", "can", "sure", "fine", "okay", "ok", "now",
+        "then", "thanks", "thank", "yes", "yeah", "indeed", "on",
+    }
+
+    _NO_REINFORCERS = {
+        "thanks", "thank", "you", "sir", "jarvis", "jamvis",
+        "don't", "dont", "bother", "need", "that", "it", "wait",
+        "cancel", "nevermind", "please", "nope", "not", "now",
+    }
+
     @classmethod
     def _is_confirmation_yes(cls, normalized: str) -> bool:
-        if not normalized:
+        """
+        v4: WHOLE-UTTERANCE matching. "yes do it" confirms; "ok so
+        what time is it" does NOT (it merely starts with ok).
+        """
+
+        text = normalized.strip().rstrip(".!,? ").strip()
+
+        if not text:
             return False
 
-        if normalized in {"y", "k", "kk", "okey"}:
+        if text in {"y", "k", "kk", "okey"}:
             return True
 
-        return any(
-            normalized == prefix or normalized.startswith(prefix + " ")
-            or normalized.startswith(prefix + ",")
-            for prefix in cls._YES_PREFIXES
-        )
+        for prefix in cls._YES_PREFIXES:
+            if text == prefix:
+                return True
+
+            if text.startswith(prefix + " "):
+                rest = text[len(prefix):].strip()
+
+                words = rest.split()
+
+                if words and all(
+                    word in cls._YES_REINFORCERS for word in words
+                ):
+                    return True
+
+        return False
 
     @classmethod
     def _is_confirmation_no(cls, normalized: str) -> bool:
-        if not normalized:
+        text = normalized.strip().rstrip(".!,? ").strip()
+
+        if not text:
             return False
 
-        if normalized in {"n"}:
+        if text in {"n"}:
             return True
 
-        return any(
-            normalized == prefix or normalized.startswith(prefix + " ")
-            or normalized.startswith(prefix + ",")
-            for prefix in cls._NO_PREFIXES
-        )
+        for prefix in cls._NO_PREFIXES:
+            if text == prefix:
+                return True
+
+            if text.startswith(prefix + " "):
+                rest = text[len(prefix):].strip()
+
+                words = rest.split()
+
+                if words and all(
+                    word in cls._NO_REINFORCERS for word in words
+                ):
+                    return True
+
+        return False
 
     # ------------------------------------------------------
     # SELF SHUTDOWN / RESTART MATCHING
@@ -4475,10 +4625,65 @@ class AgentRuntime:
                 f"and {memory_usage} percent memory usage. "
                 f"The battery is at {battery_percent} percent. "
                 f"The computer name is {hostname}."
-            )
-
-        # Default behavior for tools that already return
+            )        # Default behavior for tools that already return
         # a human-readable result.
         return result
+
+
+def _tier_for_tool(runtime, tool_name: str) -> str:
+    """
+    Permission tier for a tool (config/permissions.yaml override, else
+    the catalogue risk). Failure -> MEDIUM (audit-only concern).
+    """
+
+    try:
+        from security.permissions import tier_for
+
+        tool = runtime.tools.catalogue.get_tool(tool_name)
+
+        risk = getattr(tool, "risk", "medium") if tool else "medium"
+
+        return tier_for(tool_name, risk)
+
+    except Exception:
+        return "MEDIUM"
+
+
+def _audit_action(
+    tool_name,
+    parameters,
+    tier="",
+    decision="auto",
+    result=None,
+    elapsed_ms=None,
+):
+    """Append to data/audit.jsonl (never raises)."""
+
+    try:
+        from security.audit import log_action
+
+        log_action(
+            tool_name,
+            params=parameters,
+            tier=tier,
+            decision=decision,
+            result=(
+                result.get("message")
+                or result.get("error")
+                or (
+                    "success"
+                    if isinstance(result, dict)
+                    and result.get("success")
+                    else str(result)[:120]
+                )
+            )
+            if isinstance(result, dict)
+            else str(result)[:120],
+            elapsed_ms=elapsed_ms,
+        )
+
+    except Exception:
+        pass
+
 
         

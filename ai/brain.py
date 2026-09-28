@@ -999,6 +999,17 @@ class ReflexLayer:
         }:
             runtime = self.runtime
 
+            # Emergency stop is the LOUD version: also fires the
+            # kill switch (abort Event + callbacks).
+            try:
+                from security.kill_switch import EMERGENCY_PATTERN, get_kill_switch
+
+                if EMERGENCY_PATTERN.search(text):
+                    get_kill_switch().trigger("voice")
+
+            except Exception:
+                pass
+
             stopped = bool(
                 runtime._remaining_plan
                 or runtime.confirmations.get_pending()

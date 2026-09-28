@@ -97,6 +97,21 @@ class ToolRuntime:
         )
 
         self.register(
+            "computer.mouse_double_click",
+            self._mouse_double_click,
+        )
+
+        self.register(
+            "computer.mouse_drag",
+            self._mouse_drag,
+        )
+
+        self.register(
+            "computer.open_shortcut",
+            self._open_shortcut,
+        )
+
+        self.register(
             "computer.mouse_scroll",
             self._mouse_scroll,
         )
@@ -799,9 +814,28 @@ class ToolRuntime:
 
 
     def _mouse_click(self, button: str = "left", clicks: int = 1):
-        # `clicks` is declared in the catalogue; the controller API
-        # only supports single clicks, so it is accepted and ignored.
-        return self.computer_controller.click_mouse(button)
+        return self.computer_controller.click_mouse(
+            button,
+            clicks=clicks if isinstance(clicks, int) else 1,
+        )
+
+    def _mouse_double_click(self, button: str = "left"):
+        return self.computer_controller.click_mouse(button, clicks=2)
+
+    def _mouse_drag(self, x: int, y: int):
+        try:
+            return self.computer_controller.drag_mouse(int(x), int(y))
+
+        except (TypeError, ValueError):
+            return {
+                "success": False,
+                "error": "drag needs integer x and y coordinates",
+            }
+
+    def _open_shortcut(self, name: str):
+        from tools.shortcuts import open_shortcut
+
+        return open_shortcut(name or "")
 
 
     def _mouse_scroll(self, amount: int):
