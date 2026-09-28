@@ -1547,34 +1547,49 @@ class AgentRuntime:
             return None
 
         # Build the entity list: Start-Menu apps + desktop shortcuts.
-        candidates = {}
+        # v4.1 latency: cached for 5 minutes (a fresh scan + shortcut
+        # enumeration costs ~15-30 ms per "open X" request otherwise).
+        now = time.time()
 
-        try:
-            from tools.applications import ApplicationManager
+        cached = getattr(self, "_open_entities_cache", None)
 
-            manager = ApplicationManager()
+        if (
+            cached is not None
+            and now - cached[1] < 300.0
+        ):
+            candidates = cached[0]
 
-            for stem, path in manager.applications.items():
-                # Display name = path stem, capitalized as on disk.
-                display = Path(path).stem if path else stem.title()
+        else:
+            candidates = {}
 
-                candidates.setdefault(
-                    str(stem).lower(), str(display)
-                )
+            try:
+                from tools.applications import ApplicationManager
 
-        except Exception:
-            pass
+                manager = ApplicationManager()
 
-        try:
-            from tools.shortcuts import list_shortcuts
+                for stem, path in manager.applications.items():
+                    # Display name = path stem, capitalized on disk.
+                    display = Path(path).stem if path else stem.title()
 
-            for shortcut in list_shortcuts():
-                candidates.setdefault(
-                    shortcut["stem"], shortcut["name"]
-                )
+                    candidates.setdefault(
+                        str(stem).lower(), str(display)
+                    )
 
-        except Exception:
-            pass
+            except Exception:
+                pass
+
+            try:
+                from tools.shortcuts import list_shortcuts
+
+                for shortcut in list_shortcuts():
+                    candidates.setdefault(
+                        shortcut["stem"], shortcut["name"]
+                    )
+
+            except Exception:
+                pass
+
+            self._open_entities_cache = (candidates, now)
 
         if not candidates:
             return None
