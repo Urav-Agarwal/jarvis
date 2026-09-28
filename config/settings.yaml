@@ -1,0 +1,43 @@
+# JARVIS runtime settings.
+# Values here are defaults; environment variables in .env hold secrets.
+
+audio:
+  # Microphone device index (null = system default).
+  input_device: null
+  sample_rate: 16000
+  # Silence detection for end-of-speech.
+  silence_threshold: 0.03
+  silence_duration: 0.8
+  max_utterance_seconds: 10
+
+wake_word:
+  model: hey_jarvis
+  # Detection sensitivity: fraction of the model's raw score needed
+  # to fire. Lower = more sensitive (catches quiet/fast speech).
+  threshold: 0.35
+
+speech:
+  # Local fallback whisper model (Groq turbo is used automatically
+  # when GROQ_API_KEY is set; see audio/speech_to_text.py).
+  whisper_model: base
+  # Piper fallback voice (used only when ELEVENLABS_API_KEY is unset
+  # or the network fails).
+  tts_voice: en_US-ryan-high.onnx
+
+agent:
+  # Personality tone: formal / balanced / witty. Changes phrasing,
+  # not competence. (v2 personality layer)
+  tone: balanced
+  # Proactive mode: JARVIS mentions low battery, high CPU, or an
+  # event about to start without being asked.
+  proactive_mode: true
+  # Turns of conversation kept as context for follow-up questions.
+  context_turns: 4
+  # Abort a plan after this many consecutive tool failures.
+  max_consecutive_failures: 3
+
+memory:
+  path: data/memory.json
+
+skills:
+  path: data/skills.json

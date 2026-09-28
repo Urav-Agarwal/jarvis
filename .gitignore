@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Virtual environment
+.venv/
+
+# Environment variables / secrets
+.env
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Build files
+build/
+dist/
+
+# JARVIS local data
+data/
+models/
+
+venv/
+env/
+node_modules/
+*.bin
+*.gguf
+*.pt
+*.onnx
+*.safetensors
+*.wav
+*.mp3
+*.mp4
+.freebuff/
