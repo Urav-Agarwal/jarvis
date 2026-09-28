@@ -90,3 +90,32 @@ Updated after each to-do. Format: DONE / NEXT / OPEN PROBLEMS.
 - Untracked *.txt dumps in root still present (user to delete).
 
 ---
+
+## SILENT-REPLIES REGRESSION FIXED (Session B paused; voice first)
+
+**ROOT CAUSE (evidence: data/boot_log.txt)**
+- Every exchange raised AttributeError: 'Orchestrator' object has no
+  attribute 'stop_listener_enabled' inside _speak_until_done — BEFORE
+  TTS started. runtime_log showed 'Listener loop error' + exchange death.
+- Cause: during the session-machine edit, _on_kill_switch was spliced
+  into __init__ mid-file, so the old __init__ tail (speaking,
+  stop_listener_enabled, _last_activity, restart-flag cleanup) became
+  part of _on_kill_switch's body. Fresh Orchestrator = missing attrs =
+  silent replies.
+- NOT the duck logic, NOT the device selection, NOT the waveform/UI
+  (no UI exists yet) — verified by git diff f629c1e..178709b on audio/.
+
+**FIX**
+- Boot tail moved back into __init__; _on_kill_switch now only handles
+  its own job. Boot sanity check raises at startup if any reply-path
+  attribute is missing (loud failure instead of mute operation).
+- REAL playback test: Orchestrator()._speak_until_done('...') played
+  through speakers; barge-in mic heard JARVIS's own voice ('BARGE-IN
+  CHECK: This is the real thing') — acoustic confirmation.
+- All 10 suites green. Committed 5c17839.
+
+**NEXT: Session B (UI) — resume item 1 (orb), then panels, themes,
+tray/mini mode, screenshots. Latency instrumentation (app/latency.py
+trace + entity cache commit 629429f) already landed earlier this session.
+
+---
