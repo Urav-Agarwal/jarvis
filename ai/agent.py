@@ -568,6 +568,11 @@ User request:
                 "tool": tool.name,
                 "parameters": parameters,
                 "speech": str(decision.get("speech") or "").strip(),
+                # v4 CRITICAL FIX: propagate "then" — the loop's
+                # continue-vs-compose contract. It was dropped here,
+                # so chained multi-step reasoning NEVER continued
+                # past the first tool call in production.
+                "then": bool(decision.get("then")),
                 "request": user_input,
             }
 

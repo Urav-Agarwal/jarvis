@@ -120,6 +120,59 @@ class Orchestrator:
         # may trigger again (tuned past the tail of spoken replies).
         self.wake_cooldown = 2.2
 
+        # ------------------------------------------------------
+        # v4 SESSION: the conversation does NOT end with a task.
+        # DORMANT -> ACTIVE -> (LISTENING | THINKING | ACTING |
+        # SPEAKING) -> ACTIVE ... -> DORMANT. Sleep happens ONLY on
+        # an explicit dismissal or the idle timeout (5 min default,
+        # settings.yaml: session.idle_timeout_seconds) — never on an
+        # exchange count, never after 6 s of silence, never while a
+        # confirmation/draft/task is pending.
+        # ------------------------------------------------------
+        from assistant.session import ConversationSession
+
+        def _busy():
+            return (
+                self.agent.confirmations.has_pending()
+                or getattr(self.agent, "_pending_send", None) is not None
+                or getattr(self.agent, "_pending_draft", None) is not None
+                or getattr(self.agent, "_teaching_pending_save", None)
+                is not None
+                or getattr(self.agent, "_recorder_pending_save", None)
+                is not None
+                or self.speaking
+            )
+
+        idle_timeout = 300.0
+
+        try:
+            from app.config import get as get_setting
+
+            idle_timeout = float(
+                get_setting(
+                    "session",
+                    "idle_timeout_seconds",
+                )
+                or 300
+            )
+
+        except Exception:
+            pass
+
+        self.session = ConversationSession(
+            idle_timeout_seconds=idle_timeout,
+            busy_check=_busy,
+        )
+
+        # CHIME instead of spoken acks on re-wake: JARVIS acknowledges
+        # without contributing to the "greeting many times" problem.
+        self.wake_chime = True
+
+        # Wake-word refractory period (seconds): re-triggers inside
+        # this window after a handled wake are ignored as echoes.
+        self._wake_refractory = 1.2
+        self._last_wake_handled = 0.0
+
     def _on_kill_switch(self, reason: str = ""):
         """
         Kill-switch callback: cut speech, clear pending state, cancel
@@ -371,22 +424,45 @@ class Orchestrator:
         def watch():
             deadline = time.time() + 120  # bounded safety
 
+            duck = getattr(self.text_to_speech, "duck_event", None)
+
             while self.speaking and time.time() < deadline:
                 try:
+                    # SHORT bursts (0.7 s): the user's "hey Jarvis" /
+                    # "stop" must be caught fast, and ducking makes
+                    # JARVIS's own voice stop masking the mic while
+                    # the burst is judged.
                     audio = self.microphone.record_until_silence(
-                        max_duration=2,
-                        silence_duration=0.4,
+                        max_duration=0.7,
+                        silence_duration=0.25,
                         threshold=0.05,
-                        start_timeout=1.2,
+                        start_timeout=1.0,
                     )
 
                     if len(audio) == 0:
+                        if duck is not None:
+                            duck.clear()
+
                         continue
+
+                    # DUCK NOW: something is happening in the room —
+                    # drop JARVIS's volume while we decide whether it
+                    # is a command (echo self-masking was the v3 bug:
+                    # "hey Jarvis" while speaking did nothing).
+                    if duck is not None:
+                        duck.set()
 
                     text = self.speech_to_text.transcribe(audio)
 
                 except Exception:
+                    if duck is not None:
+                        duck.clear()
+
                     continue
+
+                finally:
+                    if duck is not None:
+                        duck.clear()
 
                 if not self.speaking:
                     break
@@ -579,6 +655,17 @@ class Orchestrator:
 
         self._remember_turn(user_input, result)
 
+        # v4: tell listen_and_process whether THIS utterance ended the
+        # session (explicit goodbye / self shutdown-restart).
+        self._session_end_requested = bool(
+            isinstance(agent_result, dict)
+            and (
+                agent_result.get("go_to_sleep")
+                or agent_result.get("self_shutdown")
+                or agent_result.get("self_restart")
+            )
+        )
+
         if isinstance(agent_result, dict) and agent_result.get(
             "self_shutdown"
         ):
@@ -734,26 +821,34 @@ class Orchestrator:
         hold_seconds: float = 0.0,
     ) -> str:
         """
-        ONE VOICE EXCHANGE. Returns the final response text.
+        ONE SESSION, many exchanges (v4).
 
-        max_followups: keep the exchange alive after the reply,
-        listening for short follow-ups ("yes", "do it", or a new
-        command) for hold_seconds each round, without needing the
-        wake word again. 0 = single exchange (legacy behavior).
+        The session stays ACTIVE until an explicit dismissal, the
+        idle timeout (session.idle_timeout_seconds, default 5 min)
+        with NOTHING pending, or the user walks away mid-task (which
+        only ends the hold when the mic times out and nothing is
+        pending). max_followups/hold_seconds are accepted for
+        backward compatibility but no longer cap anything.
         """
 
-        rounds = 1 + max(0, int(max_followups))
+        self.session.activate()
+
+        self._session_end_requested = False
 
         response = ""
 
-        for round_index in range(rounds):
+        round_index = 0
+
+        while True:
+            self.session.set_substate("LISTENING")
+
             if round_index == 0:
                 text = self.listen()
 
             else:
                 # An expected answer ("yes", a contact pick, a skill
                 # name) gets a patient mic; a conversational hold is
-                # shorter — silence ends the exchange politely.
+                # shorter — silence ends the ROUND, not the session.
                 expecting = (
                     self.agent.confirmations.has_pending()
                     or getattr(self.agent, "_pending_send", None) is not None
@@ -772,8 +867,34 @@ class Orchestrator:
                     ),
                 )
 
+            round_index += 1
+
             if not text:
-                break
+                # Silence in the hold. The session only truly ends
+                # when nothing is pending (the busy_check would have
+                # held the mic patient) AND the idle timeout has run;
+                # otherwise we simply loop back to listening. To keep
+                # the voice loop responsive we re-check: idle timeout
+                # + nothing pending -> DORMANT.
+                if (
+                    not self.session.is_busy()
+                    and self.session.idle_seconds()
+                    >= self.session.idle_timeout_seconds
+                ):
+                    self._say_session_farewell()
+
+                    break
+
+                if round_index == 1:
+                    # First listen found nothing (wake-word echo or
+                    # silence): end the exchange politely.
+                    break
+
+                # Short silence mid-conversation: keep the session,
+                # loop straight back to the mic.
+                continue
+
+            self.session.touch()
 
             # UTTERANCE GUARD: a wake-word echo, a cough, or a
             # transcribed breath must never reach the brain. Strip
@@ -811,6 +932,8 @@ class Orchestrator:
 
             watcher.start()
 
+            self.session.set_substate("THINKING")
+
             try:
                 response = self.process(text)
 
@@ -825,10 +948,12 @@ class Orchestrator:
 
                 log_event("thinking_interrupted")
 
+                self.session.touch()
+
                 if self.pending_wake_interrupt:
                     self.speak("Stopped, sir. Go ahead.")
 
-                return ""
+                continue
 
             finally:
                 self._processing_done = True
@@ -840,14 +965,12 @@ class Orchestrator:
 
                 log_event("task_interrupted")
 
-                # The interrupt came from "hey jarvis" mid-task: arm
-                # the wake bypass so the command they say next is
-                # heard WITHOUT repeating the wake word, and
-                # acknowledge the stop so JARVIS never seems deaf.
+                self.session.touch()
+
                 if self.pending_wake_interrupt:
                     self.speak("Stopped, sir. Go ahead.")
 
-                return ""
+                continue
 
             if self.on_jarvis_message:
                 self.on_jarvis_message(response)
@@ -856,6 +979,8 @@ class Orchestrator:
             # waveform state), then a brief DONE flash before the
             # follow-up hold.
             self._emit_state("SPEAKING")
+
+            self.session.set_substate("SPEAKING")
 
             speech_text = self.clean_for_speech(response)
 
@@ -892,37 +1017,44 @@ class Orchestrator:
                     self.shutdown_now()
 
             # ------------------------------------------------
-            # STAY-AWAKE RULE: the exchange NEVER dies after one
-            # reply. JARVIS always holds the mic for a follow-up —
-            # that's what makes it a conversation instead of
-            # walkie-talkie question-answer. An EXPECTED answer
-            # (confirmation, contact pick, message to dictate, skill
-            # name) gets a patient 12-second mic; any other reply
-            # gets a 6-second conversational hold. Silence ends the
-            # hold and returns to wake-word sleep naturally.
+            # v4 SESSION RULE: the task ended; the conversation did
+            # NOT. Keep holding unless the user explicitly said
+            # goodbye (or shut JARVIS down/restarted him).
             # ------------------------------------------------
-            expecting_answer = (
-                self.agent.confirmations.has_pending()
-                or getattr(self.agent, "_pending_send", None) is not None
-                or getattr(self.agent, "_recorder_pending_save", None)
-                is not None
-                or getattr(self.agent, "_teaching_pending_save", None)
-                is not None
-                or getattr(self.agent, "_pending_draft", None) is not None
-                or self.agent.recorder.is_active()
-            )
+            if self._session_end_requested:
+                self._session_end_requested = False
 
-            # Filming mode keeps the exchange open on a long leash:
-            # the user talks to the camera; when they address JARVIS
-            # the answer comes without any wake word.
-            if expecting_answer or self.filming_mode:
-                self._emit_state("LISTENING")
+                self.session.end("dismissed")
 
-                # Loop: _listen_followup handles both windows via the
-                # pending-state check inside.
-                continue
+                break
+
+            self.session.touch()
 
         return response
+
+    def _say_session_farewell(self):
+        """
+        Spoken once when the session drops to wake-word mode from the
+        idle timeout — short, and never mid-task (the caller only
+        reaches here when nothing is pending).
+        """
+
+        self.session.end("idle")
+
+        self.has_greeted = False
+
+        try:
+            if self.on_jarvis_message:
+                self.on_jarvis_message(
+                    "I'll be here if you need me, sir."
+                )
+
+            self._speak_until_done(
+                "I'll be here if you need me, sir."
+            )
+
+        except Exception:
+            pass
 
     def _listen_followup(self, start_timeout: float = 6) -> str:
         """
@@ -1180,6 +1312,20 @@ class Orchestrator:
                 detected = False
 
         if detected:
+            # v4 DEBOUNCE: a trigger inside the refractory window is
+            # the detector re-firing on the tail of the same word (or
+            # JARVIS's own reply) — never a real second "hey JARVIS".
+            now = time.time()
+
+            if now - self._last_wake_handled < self._wake_refractory:
+                print("Wake refractory: ignoring echo trigger.")
+
+                return False
+
+            self._last_wake_handled = now
+
+            self.session.activate()
+
             # Wake immediately (orb switches to LISTENING as soon as
             # this returns, before the greeting) — see app/main.py.
             greeting = self._wakeup_greeting()
@@ -1191,6 +1337,16 @@ class Orchestrator:
                 # Barge-in: a wake word during speech also silences it.
                 self.interrupt_speech()
                 self._speak_until_done(greeting)
+
+            elif self.wake_chime:
+                # v4: a short non-verbal chime acknowledges the wake
+                # without adding another spoken greeting — the orb
+                # lights up, the chime plays, JARVIS listens.
+                if self.on_jarvis_message:
+                    self.on_jarvis_message("Yes, sir?")
+
+                self.interrupt_speech()
+                self._play_chime()
 
             else:
                 # Brief acknowledgment so JARVIS never seems deaf, but
@@ -1204,10 +1360,62 @@ class Orchestrator:
 
         return detected
 
-    # A long briefing is welcome ONCE per session (the first wake
-    # after boot). After that, every wake gets a two-word ack: the
+    def _play_chime(self):
+        """
+        Two-note acknowledgment chime (~0.3 s). Cosmetic only: if the
+        audio device refuses, silence is the correct fallback.
+        """
+
+        try:
+            import numpy as _np
+            import sounddevice as _sd
+
+            rate = 44100
+
+            duration = 0.28
+
+            t = _np.linspace(0, duration, int(rate * duration), False)
+
+            # E6 -> A6, two quick soft notes.
+            wave = _np.zeros_like(t)
+
+            split = int(len(t) * 0.55)
+
+            wave[:split] = 0.20 * _np.sin(
+                2 * _np.pi * 1318.5 * t[:split]
+            )
+
+            wave[split:] = 0.20 * _np.sin(
+                2 * _np.pi * 1760.0 * t[split:]
+            )
+
+            # Fade edges so the chime never clicks.
+            fade = int(rate * 0.01)
+
+            wave[:fade] *= _np.linspace(0, 1, fade)
+
+            wave[-fade:] *= _np.linspace(1, 0, fade)
+
+            audio = (wave * 32767).astype(_np.int16)
+
+            stream = _sd.OutputStream(
+                samplerate=rate,
+                channels=1,
+                dtype="int16",
+            )
+
+            stream.start()
+            stream.write(audio)
+            stream.stop()
+            stream.close()
+
+        except Exception:
+            pass
+
+    # A long briefing is welcome ONCE per boot (or after 4+ hours of
+    # idle — a fresh day). After that, every wake gets a chime: the
     # user said "hey JARVIS" to give a command, not to hear a speech.
-    _GREETING_TTL_SECONDS = 90.0
+    _GREETING_TTL_SECONDS = 4 * 3600.0
 
     def _daily_briefing(self) -> str:
         """
@@ -1384,8 +1592,15 @@ class Orchestrator:
 
             return "I've restarted myself. All systems are back online, sir."
 
+        # Explicit sleep resets the greeting flag; honor it only when
+        # the user has actually been away a while.
         if self.has_greeted:
-            return None
+            idle = time.time() - getattr(self, "_last_activity", 0.0)
+
+            if idle < self._GREETING_TTL_SECONDS:
+                return None
+
+            self.has_greeted = False
 
         # The briefing only deserves its slot when the user has been
         # away: right after a restart acknowledgment (fresh boot) or

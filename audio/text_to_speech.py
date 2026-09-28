@@ -34,6 +34,13 @@ class TextToSpeech:
         # Global stop flag shared across instances (barge-in).
         self.stop_event = threading.Event()
 
+        # DUCK (v4): while set, playback volume drops to ~20%. The
+        # barge-in watcher sets it the moment a mic burst is detected
+        # during speech, so JARVIS's own voice stops masking the
+        # user's "hey Jarvis" / "stop" — without killing playback
+        # when the burst turns out to be background noise.
+        self.duck_event = threading.Event()
+
         self._piper_voice = None
         self._http = None
 
@@ -90,6 +97,16 @@ class TextToSpeech:
         """Interrupt current speech from any thread."""
 
         self.stop_event.set()
+
+    def _ducked(self, audio: np.ndarray) -> np.ndarray:
+        """Apply the duck volume (int16-safe) when duck_event is set."""
+
+        if self.duck_event.is_set() and audio.size:
+            audio = (audio.astype(np.int32) * 2 // 10).astype(
+                np.int16
+            )
+
+        return audio
 
     # --------------------------------------------------
     # ELEVENLABS
@@ -290,7 +307,7 @@ class TextToSpeech:
                 )
 
                 if audio.size:
-                    stream.write(audio)
+                    stream.write(self._ducked(audio))
 
         finally:
             stream.stop()
@@ -333,7 +350,8 @@ class TextToSpeech:
                     dtype=np.int16,
                 )
 
-                stream.write(audio)
+                if audio.size:
+                    stream.write(self._ducked(audio))
 
         finally:
             stream.stop()

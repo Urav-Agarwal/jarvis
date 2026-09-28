@@ -57,3 +57,36 @@ Updated after each to-do. Format: DONE / NEXT / OPEN PROBLEMS.
   verify with py_compile + grep after each edit.
 
 ---
+
+## PHASE 1 COMPLETE (all suites green, committed)
+
+**DONE**
+- assistant/session.py: DORMANT->ACTIVE->substates machine; idle timeout 300 s
+  (session.idle_timeout_seconds in settings.yaml); busy_check blocks sleep; no exchange cap.
+- listen_and_process rewritten session-driven; silence rounds hold; go_to_sleep ends;
+  idle farewell spoken once; interrupts keep the session alive.
+- Greeting: briefing once per boot / 4 h idle; chime on other wakes; 1.2 s wake refractory.
+- Barge-in: 0.7 s mic bursts + TTS duck_event (volume to 20% while judging) — fixes
+  "hey jarvis while speaking"; duck cleared in finally.
+- Budgeted loop: agent.max_reasoning_steps=12 (clamp 25) replaces fixed 4.
+- CRITICAL: AgentBrain.think() dropped `then` on actions — production loop never chained
+  steps; fixed + regression-tested (real 6-step chain).
+- Did-you-mean resolver: open X -> fuzzy apps+shortcuts; "open comment browser" ->
+  "Did you mean Comet, sir?" -> yes -> Comet opened (LIVE verified); narrow guard so
+  profile repairs/diagnostics phrasings fall through to the brain.
+- tests/test_phase1.py; all 9 suites + UI smoke green.
+
+**NEXT (Session A of continuation prompt — audio/wake verification)**
+- A1 scripts/audio_doctor.py: device listing, test tone, TTS through ElevenLabs AND Piper,
+  peak amplitudes, duck restore check, red banner on TTS failure.
+- A2 session transition log data/logs/session.log + end-to-end 10-min no-sleep simulation.
+- A3 wake doctor: RMS meter + score logging, AGC, sensitivity config, streaming wake thread.
+
+**OPEN PROBLEMS**
+- User reports: cannot hear JARVIS speak (A1 — root cause not yet found, doctor first),
+  still sleeps early (A2 — session machine exists; runtime path must be verified),
+  must SHOUT the wake word (A3 — gain/threshold/streaming suspected).
+- Piper .onnx model files may be missing from disk (only .onnx.json in git listing seen).
+- Untracked *.txt dumps in root still present (user to delete).
+
+---

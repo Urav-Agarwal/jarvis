@@ -844,14 +844,10 @@ def main():
                     # "yes" — no fresh wake word needed).
                     bridge.state_message.emit("LISTENING")
 
-                    orchestrator.listen_and_process(
-                        max_followups=(
-                            orchestrator.conversation_max_exchanges
-                        ),
-                        hold_seconds=(
-                            orchestrator.conversation_hold_seconds
-                        ),
-                    )
+                    # v4: the session machine owns the hold now — no
+                    # exchange cap, no 6-second drop. Arguments kept
+                    # out for clarity; listen_and_process ignores them.
+                    orchestrator.listen_and_process()
 
                 except Exception as error:
                     # NEVER let an exception kill the listener thread:

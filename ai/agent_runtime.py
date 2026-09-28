@@ -1,6 +1,7 @@
 import difflib
 import re
 import time
+from pathlib import Path
 
 from ai.agent import AgentBrain
 from app.activity_log import log_event
@@ -81,12 +82,28 @@ class AgentRuntime:
         self.reflexes = None
 
         if BrainV3 is not None and ReflexLayer is not None:
+            # v4: the step budget is configurable (up to 25) so real
+            # multi-step tasks fit in ONE reasoning pass; the failure
+            # limit and interrupt checks still bound the loop.
+            max_steps = 8
+
+            try:
+                from app.config import get as _cfg
+
+                max_steps = int(
+                    _cfg("agent", "max_reasoning_steps") or 8
+                )
+
+            except Exception:
+                pass
+
             self.brain_loop = BrainV3(
                 reasoner=self.brain,
                 execute_tool=self._executor,
                 note_receipt=self._set_tool_receipt,
                 interrupt_check=self.interrupt_check,
                 pre_act=self._pre_act_for_loop,
+                max_steps=max(1, min(25, max_steps)),
             )
 
             self.brain_loop.receipt_for_judge = self._judge_receipt
@@ -362,6 +379,45 @@ class AgentRuntime:
 
         if teaching is not None:
             return teaching
+
+        # -------------------------------------------------
+        # DID-YOU-MEAN (v4): an "open X" request resolves apps and
+        # desktop shortcuts with fuzzy matching; a medium-confidence
+        # match ASKS ("Did you mean Comet?") instead of acting. The
+        # stored pending app is executed by the reflex "yes" below.
+        # -------------------------------------------------
+
+        pending_app = getattr(self, "_pending_did_you_mean", None)
+
+        if pending_app is not None and self._is_confirmation_yes(
+            user_input.lower().strip()
+        ):
+            app = pending_app
+
+            self._pending_did_you_mean = None
+
+            result = self._executor(
+                "application.open",
+                {"application": app},
+            )
+
+            return {
+                "success": True,
+                "result": (
+                    result.get("message")
+                    or f"Opening {app}, sir."
+                ),
+            }
+
+        if getattr(self, "_pending_did_you_mean", None) is not None:
+            # Any non-yes utterance drops the pending suggestion —
+            # but a "no" explicitly declines it.
+            self._pending_did_you_mean = None
+
+        open_reply = self._handle_open_request(user_input)
+
+        if open_reply is not None:
+            return open_reply
 
         # -------------------------------------------------
         # DETERMINISTIC REPAIRS (narrow, executor-backed)
@@ -1396,6 +1452,140 @@ class AgentRuntime:
         return {
             "success": False,
             "result": self._unknown_request_text(decision, user_input),
+        }
+
+    # ------------------------------------------------------
+    # DID-YOU-MEAN RESOLVER (bug 2.6): STT mishears app/shortcut
+    # names ("open comet browser" -> "open comment browser").
+    # Zero-LLM: rapidfuzz against installed apps + desktop
+    # shortcuts. A strong match acts directly; a medium match asks
+    # "Did you mean Comet?" and the reflex layer executes the yes.
+    # ------------------------------------------------------
+
+    _OPEN_REQUEST = re.compile(
+        r"^\s*(?:hey\s+)?(?:jarvis|jamvis)?\s*"
+        r"(?:please\s+)?(?:could\s+you\s+|would\s+you\s+)?"
+        r"(?:open|launch|start)\s+"
+        r"(?:up\s+|the\s+)?"
+        r"([a-z0-9][a-z0-9 .-]{0,28}?)"
+        r"\s*(?:app|application|browser|shortcut|for me|please|now)?"
+        r"[.?!]?\s*$",
+        re.IGNORECASE,
+    )
+
+    _DID_YOU_MEAN_THRESHOLD = 62.0
+    _DIRECT_THRESHOLD = 86.0
+
+    def _handle_open_request(self, user_input: str):
+        """
+        Deterministic open-app resolution with fuzzy entity matching.
+        Returns a reply dict, or None when this is not an open
+        request (the brain handles those as usual).
+
+        Deliberately NARROW: simple "open X" requests only. Anything
+        with a profile, multi-clause phrasing, or diagnostics-vocabulary
+        belongs to the dedicated repairs / the reasoning brain.
+        """
+
+        match = self._OPEN_REQUEST.match(user_input.strip())
+
+        if not match:
+            return None
+
+        spoken = match.group(1).strip()
+
+        # Multi-clause or special forms are NOT simple app opens.
+        if (
+            not spoken
+            or len(spoken) < 3
+            or len(spoken.split()) > 3
+            or re.search(
+                r"\bprofile\b|\bwith\b|\band\b|\bthen\b"
+                r"|\bdiagnostic|\bscan\b|\btest\b|\bwebsite\b"
+                r"|\.com\b|\bhttp\b",
+                spoken,
+                re.IGNORECASE,
+            )
+        ):
+            return None
+
+        # Build the entity list: Start-Menu apps + desktop shortcuts.
+        candidates = {}
+
+        try:
+            from tools.applications import ApplicationManager
+
+            manager = ApplicationManager()
+
+            for stem, path in manager.applications.items():
+                # Display name = path stem, capitalized as on disk.
+                display = Path(path).stem if path else stem.title()
+
+                candidates.setdefault(
+                    str(stem).lower(), str(display)
+                )
+
+        except Exception:
+            pass
+
+        try:
+            from tools.shortcuts import list_shortcuts
+
+            for shortcut in list_shortcuts():
+                candidates.setdefault(
+                    shortcut["stem"], shortcut["name"]
+                )
+
+        except Exception:
+            pass
+
+        if not candidates:
+            return None
+
+        from rapidfuzz import fuzz
+
+        best_name = None
+        best_score = 0.0
+
+        for stem, display in candidates.items():
+            # ratio + token_set only: partial_ratio made "six
+            # diagnostics" score high against "Memory Diagnostics
+            # Tool" and hijack diagnostics requests.
+            score = max(
+                fuzz.ratio(spoken.lower(), stem),
+                fuzz.token_set_ratio(spoken.lower(), stem),
+            )
+
+            if score > best_score:
+                best_name = display
+                best_score = score
+
+        if best_name is None or best_score < self._DID_YOU_MEAN_THRESHOLD:
+            return None
+
+        if best_score >= self._DIRECT_THRESHOLD:
+            # Confident: execute through the executor (audited).
+            result = self._executor(
+                "application.open",
+                {"application": best_name},
+            )
+
+            return {
+                "success": True,
+                "result": (
+                    result.get("message")
+                    or f"Opening {best_name}, sir."
+                ),
+            }
+
+        # Medium confidence: ask. The yes-arm stores the pending
+        # app; the next "yes" opens it.
+        self._pending_did_you_mean = best_name
+
+        return {
+            "success": True,
+            "result": f"Did you mean {best_name}, sir?",
+            "clarification": True,
         }
 
     # ------------------------------------------------------

@@ -1,66 +1,53 @@
 # JARVIS V4 CHANGELOG
 
-## Phase 0 — Stabilize + Safety Foundation (this commit)
+## Phase 1 — Session + Voice Engine (this commit)
 
-### Fixed (user-reported v3 bugs)
-- **2.1 Desktop shortcut / invisible mouse**
-  - `tools/computer_controller.py`: per-monitor DPI awareness at
-    construction (`SetProcessDpiAwareness(2)`) so vision coordinates
-    match physical pixels on scaled displays.
-  - `move_mouse(x, y, duration=0.45)` now GLIDES with ease-in-out
-    interpolation (visible motion instead of a teleport).
-  - `click_mouse(button, clicks)` honors `clicks`; `clicks=2` is a
-    real double-click (two down/up pairs 90 ms apart). v3 silently
-    ignored the parameter — "double-click the Instagram shortcut"
-    clicked once at best.
-  - NEW `drag_mouse(x, y)` (press, glide, release).
-  - Every motion checks `ComputerController.abort_event` (kill switch).
-  - NEW `tools/shortcuts.py`: enumerate user + Public Desktop
-    `.lnk`/`.url`, rapidfuzz match, `os.startfile` the target.
-    NEW catalogue tools: `computer.open_shortcut`,
-    `computer.mouse_double_click`, `computer.mouse_drag`.
-- **2.2 "What time is it?" failed**
-  - Zero-LLM time/date/day reflex in `AgentRuntime.process()`
-    (`_handle_time_question`) — answers from the local clock
-    instantly; also added time/date/day terms to the router's
-    `_SYSTEM_TERMS`.
-- **2.6 groundwork** — the shortcut fuzzy resolver already maps
-  "comment" -> "Comet" (verified on the real desktop, score 83.3);
-  the did-you-mean clarify flow lands in Phase 1.
-
-### Safety foundation (3.A)
-- `security/permissions.py` (was EMPTY): READ/LOW/MEDIUM/HIGH tiers,
-  `config/permissions.yaml` overrides, HIGH always confirms.
-- `security/audit.py` (was EMPTY): append-only `data/audit.jsonl`,
-  secret redaction, size-capped rotation, `summarize_today()` for
-  "what did you do today?". Executor audits every auto/confirmed run.
-- `security/confirmations.py`: 30-second expiry, FIFO queue (multiple
-  pending actions), strict whole-utterance yes ("ok so what time is
-  it" can never execute a queued action), clear-no cancellation.
-  Executor `request_confirmation` read-back names the exact action.
-- `tools/filesystem_observer.delete`: Recycle Bin only (send2trash);
-  refuses drive roots, C:\Windows, Program Files, the user profile
-  root, the JARVIS project tree, and any .git directory.
-- `security/kill_switch.py` (NEW): Ctrl+Alt+Shift+J global hotkey +
-  "Jarvis, emergency stop" voice phrase; aborts mouse motion, LLM
-  calls (provider polls a list of abort events), speech, and pending
-  state; auto-clears after a grace period.
+### Fixed (user-reported v3 bugs: sleep, repeated greetings, multi-step)
+- **Session state machine** (`assistant/session.py`, NEW): DORMANT ->
+  ACTIVE -> (LISTENING|THINKING|ACTING|SPEAKING) -> ACTIVE ... ->
+  DORMANT. No exchange cap (the old 4-exchange max is gone); silence
+  inside a session loops back to the mic instead of sleeping. Sleep
+  only on explicit dismissal ("that's all" / self shutdown-restart)
+  or the configurable idle timeout (`session.idle_timeout_seconds`,
+  default 300 s) with NOTHING pending. Busy check (confirmations,
+  drafts, contact picks, teaching saves, recorder, speech) blocks
+  sleep at any idle time. One spoken farewell ("I'll be here if you
+  need me, sir.") when the session ends from idle — never mid-task.
+- **`listen_and_process` rewritten** to be session-driven: silence
+  rounds keep the session; `go_to_sleep`/shutdown/restart end it;
+  interrupts (`stop` / `hey jarvis` mid-think) keep it alive.
+- **Greeting sanity**: briefing once per boot (or after 4+ hours
+  idle — `_GREETING_TTL_SECONDS = 4*3600`); every other wake gets a
+  short two-note **chime** instead of another spoken ack; wake-word
+  refractory (1.2 s) swallows detector echo re-triggers.
+- **Barge-in while speaking (2.4)**: the stop-listener now records in
+  0.7 s bursts and sets the TTS `duck_event` the moment any sound is
+  detected — JARVIS ducks to ~20% volume while judging the burst, so
+  the user's "hey Jarvis" is no longer masked by his own voice.
+  Ducking clears in a `finally` (never left stuck).
+- **Budgeted step loop**: `agent.max_reasoning_steps` (default 12,
+  clamp 1..25) replaces the fixed 4-step cap.
+- **CRITICAL brain fix**: `AgentBrain.think()` DROPPED the `then`
+  field on action decisions — in production the loop never continued
+  past the first tool call (only the fake-reasoner tests saw chained
+  steps). Now propagated; test_phase1 runs a real 6-step chain.
+- **Did-you-mean resolver (2.6)**: `_handle_open_request` — rapidfuzz
+  over Start-Menu apps + desktop shortcuts. Strong match opens
+  directly through the executor; medium match asks "Did you mean
+  Comet, sir?" and the next "yes" opens it (pending slot cleared on
+  any non-yes). Verified live: "open comment browser" -> "Did you
+  mean Comet, sir?" -> "yes" -> Comet launched. Deliberately narrow:
+  >3 words, profile/multi-clause/diagnostics phrasings fall through
+  to the brain (regression-tested against the profile repair).
 
 ### Tests
-- `tests/test_phase0.py` (NEW): 50+ checks — time reflex, shortcut
-  matching, strict confirmations, expiry/queue, tiers, audit
-  redaction, protected paths, kill switch, mouse contract.
-- `tests/test_interrupt_and_confirm.py`: the "other input cancels"
-  case now uses "what is the capital of france" — time questions are
-  a zero-LLM reflex in v4, so the scripted LLM response would never
-  be consumed (intentional behavior change).
+- `tests/test_phase1.py` (NEW): state machine (busy blocks sleep,
+  dismissal mid-task, 50-exchange hold), orchestrator integration
+  with fake mic/TTS (silence rounds hold, go_to_sleep ends, idle
+  farewell), chime + refractory wake path, 6-step budgeted chain.
+- Full suite (9) + UI smoke green.
 
-### Config/deps
-- Added `config/permissions.yaml`; deps: `send2trash`, `rapidfuzz`,
-  `keyboard`.
-
-### Known gaps (next phases)
-- Session state machine (no mid-conversation sleep): Phase 1.
-- Barge-in while speaking, chime instead of repeated greeting: Phase 1.
-- Did-you-mean entity resolver for STT mishears: Phase 1.
-- Personality layer: Phase 2. WhatsApp bridge: Phase 5.
+### Known gaps (next sessions)
+- Audio hardware verification + wake sensitivity (Session A of the
+  continuation prompt).
+- UI overhaul, persona layer, screen awareness, connectors.

@@ -1,6 +1,12 @@
 # JARVIS runtime settings.
 # Values here are defaults; environment variables in .env hold secrets.
 
+session:
+  # v4: the conversation stays ACTIVE across tasks and follow-ups.
+  # JARVIS returns to wake-word mode only after this many seconds of
+  # silence (never mid-task, never while a confirmation pends).
+  idle_timeout_seconds: 300
+
 audio:
   # Microphone device index (null = system default).
   input_device: null
@@ -28,6 +34,9 @@ agent:
   # Personality tone: formal / balanced / witty. Changes phrasing,
   # not competence. (v2 personality layer)
   tone: balanced
+  # v4: reasoning-step budget per request (the v3 fixed cap was 4 —
+  # too small for real multi-step tasks). Hard-clamped to 25.
+  max_reasoning_steps: 12
   # Proactive mode: JARVIS mentions low battery, high CPU, or an
   # event about to start without being asked.
   proactive_mode: true
