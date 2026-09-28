@@ -119,3 +119,37 @@ tray/mini mode, screenshots. Latency instrumentation (app/latency.py
 trace + entity cache commit 629429f) already landed earlier this session.
 
 ---
+
+## MIC GATE RECALIBRATED for the fixed mic (v4.1.2, commit c4b6ccd)
+
+**EVIDENCE (data/runtime_log.txt + mic_debug.log design)**
+- Wake scores with new mic: 0.96/0.48/0.43/0.29 at gain 1.0 — detector
+  hears fine now; old AGC 25x risked amplifying room noise.
+- 'Recording time: 10.18-10.23s' repeatedly = utterances ran to
+  max_duration (old silence logic + followup loops: FOLLOW-UP 'So',
+  'I cannot hear'...).
+- 'I cannot hear that' string does NOT exist anywhere in code — it was
+  the LLM's own reply to garbage/empty utterances reaching the brain.
+
+**FIXES**
+- Microphone: floor = median of first 0.5 s (locked); gate = floor*3
+  clamped [0.012, 0.045] (config audio.speech_gate_min/max); utterance
+  ends after 0.7 s below gate; normalization ONLY when peak < 0.05
+  (strong 0.2-0.3 captures pass untouched); end-reason + per-frame
+  decisions logged to data/logs/mic_debug.log.
+- Wake AGC: gain 1.0 below rms 0.01 (no noise amplification), cap 2.0.
+- Wake flow: chime ONLY (no spoken 'Yes, sir?'); no greeting when the
+  session is already ACTIVE; wake ignored while speaking (barge-in owns
+  that); refractory kept.
+- 'Sorry, I didn't catch that.' spoken at most ONCE per session-loop,
+  ONLY when STT got real audio and returned empty.
+- tests/test_mic_gate.py (synthetic audio): noisy-room phrase ends <2.5s
+  (not max_duration), trailing silence ends capture <3s, noise-only
+  captures nothing, quiet-mic compat, AGC noise floor, chime-only wake,
+  wake-ignored-while-speaking. ALL 11 SUITES GREEN.
+
+**NEXT: resume Session B (UI): orb -> panels -> themes/tray ->
+screenshots in docs/ui/. Watch data/logs/mic_debug.log on the user's
+next live exchange to confirm end-of-utterance timing (~1s after speech).
+
+---
